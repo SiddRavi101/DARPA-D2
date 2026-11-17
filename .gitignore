@@ -36,3 +36,6 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+
+# Training runs / synthetic data (regenerate with synthetic/generate.py)
+qualification/runs/

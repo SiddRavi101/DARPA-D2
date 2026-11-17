@@ -148,3 +148,23 @@ def test_cli_and_validator_exit_codes(image_dir, tmp_path):
     assert validate_predictions.main([str(bad)]) == 2
     bad.write_text('{"schema_version": NaN}')
     assert validate_predictions.main([str(bad)]) == 2
+
+
+def test_score_metric(tmp_path):
+    from score import score
+
+    gt = dict(LABELS)
+    assert score(gt, gt)["overall_accuracy"] == 1.0
+    pred = {k: list(v) for k, v in gt.items()}
+    pred["a.jpg"][0] = "no_injury"          # 1 wrong site out of 16
+    r = score(pred, gt)
+    assert r["overall_accuracy"] == 15 / 16 and r["per_site_accuracy"]["upper_extremity:left"] == 0.75
+
+
+def test_synthetic_generator_labels_are_valid(tmp_path):
+    sys.path.insert(0, str(ROOT / "synthetic"))
+    import generate
+
+    generate.main(["--out", str(tmp_path / "s"), "--n", "6", "--seed", "3"])
+    doc = json.loads((tmp_path / "s" / "labels.json").read_text())
+    assert schema.validate_document(doc, [p.name for p in schema.list_images(tmp_path / "s")]) == []

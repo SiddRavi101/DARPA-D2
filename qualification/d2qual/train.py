@@ -179,11 +179,11 @@ def main(argv=None) -> None:
                 continue
             val = folds[i]
             trn = [x for j, f in enumerate(folds) if j != i for x in f]
-            print(f"── fold {i} ({len(trn)} train / {len(val)} val)")
+            print(f"-- fold {i} ({len(trn)} train / {len(val)} val)")
             results[f"fold{i}"] = train_one(args, trn, val, labels, out / f"fold{i}.pt", device)
         accs = [r["overall_accuracy"] for r in results.values() if r.get("overall_accuracy") is not None]
         if accs:
-            print(f"CV overall accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+            print(f"CV overall accuracy: {np.mean(accs):.4f} +/- {np.std(accs):.4f}")
     (out / "train_report.json").write_text(json.dumps(results, indent=2, default=float))
 
 

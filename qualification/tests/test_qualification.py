@@ -168,3 +168,33 @@ def test_synthetic_generator_labels_are_valid(tmp_path):
     generate.main(["--out", str(tmp_path / "s"), "--n", "6", "--seed", "3"])
     doc = json.loads((tmp_path / "s" / "labels.json").read_text())
     assert schema.validate_document(doc, [p.name for p in schema.list_images(tmp_path / "s")]) == []
+
+
+def test_grouped_folds_never_split_a_group():
+    from d2qual.train import grouped_folds, load_groups
+
+    ids, labels = [], {}
+    rng = random.Random(0)
+    for scene in range(12):
+        for shot in range(rng.randint(1, 6)):
+            iid = f"scene{scene:02d}_shot{shot}.jpg"
+            ids.append(iid)
+            labels[iid] = [rng.choice(schema.CLASSES) for _ in range(4)]
+    groups = load_groups(ids, group_regex=r"^(scene\d+)_")
+    assert len(set(groups.values())) == 12
+    folds = grouped_folds(ids, labels, groups, 4, seed=1)
+    assert sorted(x for f in folds for x in f) == sorted(ids)
+    fold_of_group = {}
+    for fi, f in enumerate(folds):
+        for iid in f:
+            assert fold_of_group.setdefault(groups[iid], fi) == fi  # one fold per group
+    assert all(folds)
+
+
+def test_groups_file(tmp_path):
+    from d2qual.train import load_groups
+
+    p = tmp_path / "g.csv"
+    p.write_text("image_id,group\na.jpg,m1\nb,m1\n")
+    g = load_groups(["a.jpg", "b.PNG", "c.jpg"], groups_file=str(p))
+    assert g["a.jpg"] == g["b.PNG"] == "m1" and g["c.jpg"].startswith("__single__")

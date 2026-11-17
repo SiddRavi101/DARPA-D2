@@ -1,4 +1,4 @@
-# DARPA D2 Sprint — SecondLife team
+# DARPA D2 Sprint — Team Pinpoint
 
 Refactor of [SecondLife](https://github.com/rmagesh-quml/SecondLife_GoogleHackathon) (offline Gemma 4 E4B emergency assistant with TCCC/MARCH mode, FAISS + BM25 protocol RAG and a hash-chained audit log) into the DARPA **Documentation and Decision Support (D2) Sprint**.
 
@@ -24,7 +24,7 @@ Refactor of [SecondLife](https://github.com/rmagesh-quml/SecondLife_GoogleHackat
   * There is a 50-minute wall-clock budget (the limit is 1 h).
   * If CUDA fails, inference falls back to the CPU, and an out-of-memory error triggers a per-image retry.
   * The output is checked by a local copy of the JHU/APL validator.
-* **Optional Gemma 4 vision fallback** (`D2_ENABLE_VLM=1`): this reuses SecondLife's 768×768 frame contract and JSON-only prompt parsing for zero-shot answers before any training.
+* **Optional Gemma 4 vision fallback** (`D2_ENABLE_VLM=1`): this reuses SecondLife's 768×768 frame contract and JSON-only prompt parsing for zero-shot answers before any training. It is for experiments only. The submission image leaves out `transformers` to stay small and quick to scan, so add it back in `requirements.txt` if you ever ship this fallback.
 
 ### Proof of concept (synthetic data, RTX 4090)
 The pipeline ran end to end on 3,000 procedurally generated simulated-casualty images and was scored on 600 held-out ones. It reached **96.5% overall accuracy** (macro-F1 0.964, 5-fold CV 96.9% ± 0.8%). The prior-only fallback scores 45.9% on the same images. These are synthetic images, so this number does not predict the score on DARPA's photos. See [results/synthetic_poc_2026-11-17.md](qualification/results/synthetic_poc_2026-11-17.md) for the full breakdown. To reproduce on any GPU box, run `bash qualification/scripts/run_synthetic_poc.sh`.
@@ -32,10 +32,15 @@ The pipeline ran end to end on 3,000 procedurally generated simulated-casualty i
 ### Train (on the DARPA training set, GPU machine)
 ```bash
 cd qualification
-pip install torch torchvision timm==1.0.12 pillow
+pip install torch torchvision -r requirements-train.txt
 python -m d2qual.train --images /data/d2/train/images --labels /data/d2/train/labels.json \
-    --out model/weights --folds 5 --epochs 25 --batch 16
+    --out model/weights --folds 5 --epochs 25 --batch 16 \
+    --group-regex '^(<scene-or-manikin-id-pattern>)'   # or --groups-file groups.csv
 ```
+**Always use grouped CV on the real data.** DARPA's set very likely has several shots of the same manikin or scene. Plain stratified folds would put near-duplicates in both training and validation and inflate the score. `--group-regex` takes the first capture group of the filename as the group ID. Alternatively, `--groups-file` reads a CSV with `image_id,group` columns. Whole groups always land in the same fold.
+
+Install training dependencies with `pip install -r requirements-train.txt`. The submission image uses the slimmer, exactly pinned `requirements.txt`.
+
 The label loader accepts several layouts: an ICD-style `predictions.json`, a bare prediction list, JSONL, a long CSV (`image_id,body_region,laterality,injury_type`), a wide CSV (`LUE,RUE,LLE,RLE` …), or a `{image: {site: class}}` dict. Things to try for higher CV accuracy:
 * `--backbone eva02_base_patch14_448.mim_in22k_ft_in22k_in1k --size 448`
 * `--backbone convnext_base.fb_in22k_ft_in1k_384`

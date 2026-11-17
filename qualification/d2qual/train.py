@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import random
+import re
 import time
 from collections import Counter
 from pathlib import Path
@@ -48,6 +49,72 @@ def stratified_folds(ids: list[str], labels: dict[str, list[str]], k: int, seed:
         rng.shuffle(members)
         for m in members:
             min(folds, key=len).append(m)
+    return folds
+
+
+def load_groups(ids: list[str], group_regex: str | None = None, groups_file: str | None = None) -> dict[str, str] | None:
+    """
+    Map image_id -> group (scene / manikin / session). Images of the same group are
+    never split across train and val, so near-duplicate shots can't inflate CV.
+
+      --group-regex '^(scene\\d+)_'      group = first capture group (or whole match)
+      --groups-file groups.csv          CSV with columns image_id,group
+    Images the regex doesn't match, or missing from the CSV, become singleton groups.
+    """
+    if not group_regex and not groups_file:
+        return None
+    out: dict[str, str] = {}
+    if groups_file:
+        import csv
+
+        with open(groups_file, newline="", encoding="utf-8-sig") as f:
+            rows = {r["image_id"]: r["group"] for r in csv.DictReader(f)}
+        by_stem = {Path(k).stem.lower(): v for k, v in rows.items()}
+        for i in ids:
+            g = rows.get(i) or by_stem.get(Path(i).stem.lower())
+            out[i] = str(g) if g is not None else f"__single__{i}"
+    else:
+        pat = re.compile(group_regex)
+        for i in ids:
+            m = pat.search(i)
+            out[i] = (m.group(1) if m and m.groups() else m.group(0)) if m else f"__single__{i}"
+    return out
+
+
+def grouped_folds(ids: list[str], labels: dict[str, list[str]], groups: dict[str, str],
+                  k: int, seed: int) -> list[list[str]]:
+    """
+    Group-aware k-fold: whole groups are assigned to folds, largest first, each to the
+    fold that best balances size and per-site label distribution (greedy).
+    """
+    rng = random.Random(seed)
+    members: dict[str, list[str]] = {}
+    for i in ids:
+        members.setdefault(groups[i], []).append(i)
+    order = sorted(members, key=lambda g: (-len(members[g]), rng.random()))
+
+    def label_counts(img_ids):
+        c = Counter()
+        for i in img_ids:
+            for s, lab in enumerate(labels[i]):
+                c[(s, lab)] += 1
+        return c
+
+    total = label_counts(ids)
+    target = {key: v / k for key, v in total.items()}
+    folds: list[list[str]] = [[] for _ in range(k)]
+    fold_counts = [Counter() for _ in range(k)]
+    for g in order:
+        gc = label_counts(members[g])
+
+        def cost(f):
+            size_pen = (len(folds[f]) + len(members[g])) / max(1, len(ids) / k)
+            lab_pen = sum(abs(fold_counts[f][key] + gc[key] - target[key]) for key in target) / max(1, sum(target.values()))
+            return size_pen + lab_pen
+
+        best = min(range(k), key=cost)
+        folds[best].extend(members[g])
+        fold_counts[best].update(gc)
     return folds
 
 
@@ -156,6 +223,9 @@ def main(argv=None) -> None:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-pretrained", action="store_true", help="debug only")
+    ap.add_argument("--group-regex", default=None,
+                    help="regex on image_id; first capture group = scene/manikin id (grouped CV)")
+    ap.add_argument("--groups-file", default=None, help="CSV image_id,group for grouped CV")
     args = ap.parse_args(argv)
 
     set_seed(args.seed)
@@ -173,7 +243,18 @@ def main(argv=None) -> None:
     if args.folds <= 1:
         results["full"] = train_one(args, ids, [], labels, out / "full.pt", device)
     else:
-        folds = stratified_folds(ids, labels, args.folds, args.seed)
+        groups = load_groups(ids, args.group_regex, args.groups_file)
+        if groups:
+            n_groups = len(set(groups.values()))
+            singles = sum(1 for g in groups.values() if g.startswith("__single__"))
+            print(f"grouped CV: {n_groups} groups ({singles} ungrouped images as singletons)")
+            if n_groups < args.folds:
+                raise SystemExit(f"only {n_groups} groups for {args.folds} folds")
+            folds = grouped_folds(ids, labels, groups, args.folds, args.seed)
+        else:
+            print("WARNING: plain stratified CV - near-duplicate shots of one scene can leak "
+                  "across folds; pass --group-regex or --groups-file for real data")
+            folds = stratified_folds(ids, labels, args.folds, args.seed)
         for i in range(args.folds):
             if args.only_fold is not None and i != args.only_fold:
                 continue

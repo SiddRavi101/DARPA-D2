@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Build → local smoke test → ClamAV scan → push to GitLab registry → print digest.
 # Mirrors ICD v1.1 §3.5 and §4.1. Usage:
-#   TEAM=myteam PROJECT=gitlab-user/d2 TAG=v1 EMAIL=me@x.com ./scripts/submit.sh
+#   TEAM=Pinpoint PROJECT=gitlab-user/d2 TAG=v1 EMAIL=me@x.com ./scripts/submit.sh
 set -euo pipefail
 : "${TEAM:?}" "${PROJECT:?}" "${TAG:?}" "${EMAIL:?}"
 cd "$(dirname "$0")/.."
 
-IMAGE="${TEAM}-d2-qualification-task:${TAG}"
+TEAM_SLUG=$(echo "$TEAM" | tr "[:upper:] " "[:lower:]-")
+IMAGE="${TEAM_SLUG}-d2-qualification-task:${TAG}"
 REMOTE="registry.gitlab.com/${PROJECT}/${IMAGE}"
 
 ls model/weights/*.pt >/dev/null 2>&1 || { echo "No trained checkpoints in model/weights — train first"; exit 1; }

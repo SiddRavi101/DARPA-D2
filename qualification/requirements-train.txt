@@ -1,0 +1,11 @@
+# Training / GPU dev box (torch comes from the PyTorch base image or your env).
+# huggingface_hub must stay < 2: 2.x removed an API timm 1.0.12 imports, so
+# pretrained-weight downloads fail with "package not installed".
+timm==1.0.12
+huggingface_hub>=0.23,<2
+safetensors>=0.4
+pillow>=10.2
+numpy
+# Optional zero-shot Gemma backend experiments (not shipped in the submission image)
+# transformers>=4.57
+# accelerate>=1.0

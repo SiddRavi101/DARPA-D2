@@ -1,9 +1,12 @@
-# torch / torchvision come from the pytorch/pytorch base image (2.5.1 + CUDA 12.4)
+# Submission image (inference only). torch 2.5.1 + CUDA 12.4 + numpy come from the
+# pytorch/pytorch base image. Everything is pinned exactly: an unpinned
+# huggingface_hub 2.x silently broke timm 1.0.12 during the GPU proof of concept.
+#
+# The optional Gemma zero-shot backend (d2qual/vlm.py) is deliberately NOT installed:
+# it only runs when no trained checkpoint exists, which never happens in a real
+# submission, and transformers would add GBs to the image and ClamAV scan time.
+# Training-only deps live in requirements-train.txt.
 timm==1.0.12
-huggingface_hub>=0.23,<2
-safetensors>=0.4
-pillow>=10.2
-numpy<2.3
-# Optional Gemma 4 zero-shot backend (D2_ENABLE_VLM=1). Remove to slim the image.
-transformers>=4.57
-accelerate>=1.0
+huggingface_hub==0.26.2
+safetensors==0.4.5
+pillow==10.4.0

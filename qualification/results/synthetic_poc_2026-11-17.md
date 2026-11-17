@@ -56,3 +56,13 @@ For comparison, the prior-only fallback (no trained model, every limb `no_injury
 1. Fine-tune the same pipeline on the real images, optionally starting from these synthetic weights.
 2. Compare 384 vs 512 px and ConvNeXt-S vs EVA02-B by cross-validation accuracy.
 3. Run `scripts/submit.sh`: build, smoke test with `--network none`, ClamAV scan, push to GitLab.
+
+## Container verification (same day, local Docker 27.1.1)
+| Check | Result |
+|---|---|
+| `docker build` (pinned `requirements.txt`, no transformers) | OK. `pinpoint-d2-qualification-task:dev`, **6.17 GB** (limit 20 GB) |
+| Run like the evaluator: `--network none`, input `:ro`, output `:rw` | OK. 26/26 predictions; the validator passed inside and outside the container |
+| Corrupt input file | Labelled `not_testable` × 4. The run did not crash |
+| Submission metadata | `team_name: Pinpoint` |
+| GPU path inside the container | **Not tested locally**: the laptop has no NVIDIA GPU, so the run used the CPU fallback. The GPU code path was verified on the RTX 4090 pod outside Docker |
+| ClamAV (ICD §3.5 command, `clamav/clamav:latest`, engine 1.5.4) | **Infected files: 0**. 5.80 GiB read, 330.86 MiB scanned under the default size limits |

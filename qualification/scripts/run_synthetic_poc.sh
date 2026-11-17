@@ -20,7 +20,7 @@ if [ -d DARPA-D2 ]; then git -C DARPA-D2 pull -q --ff-only; else git clone --dep
 cd DARPA-D2/qualification
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 # huggingface_hub + safetensors are needed to download pretrained backbone weights
-pip install -q "timm==1.0.12" "huggingface_hub>=0.23,<2" safetensors 2>&1 | tail -1
+pip install -q -r requirements-train.txt 2>&1 | tail -1
 python -c "import timm, huggingface_hub, timm.models._hub as th; assert th._has_hf_hub, \"timm cannot use huggingface_hub\"; print(\"timm\", timm.__version__, \"hf_hub\", huggingface_hub.__version__)" \
   || { echo "DEPENDENCY_INSTALL_FAILED"; exit 1; }
 

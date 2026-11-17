@@ -1,6 +1,6 @@
 # D2 Sprint Part 2 qualification container (ICD v1.1)
-#   build:  docker build -t <team>-d2-qualification-task:<tag> \
-#             --build-arg TEAM_NAME=<team> --build-arg CONTACT_EMAIL=<email> qualification/
+#   build:  docker build -t pinpoint-d2-qualification-task:<tag> \
+#             --build-arg TEAM_NAME=Pinpoint --build-arg CONTACT_EMAIL=<email> qualification/
 #   run:    docker run --rm --gpus all --network none \
 #             -v /input:/app/input:ro -v /output:/app/output:rw <image>
 #
@@ -8,7 +8,7 @@
 # No NVIDIA kernel driver is installed in the image (ICD §5).
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-ARG TEAM_NAME=secondlife
+ARG TEAM_NAME=Pinpoint
 ARG CONTACT_EMAIL=set-at-build@example.com
 ARG SUBMISSION_VERSION=1.0.0
 
@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt && rm -rf /root/.cache
 COPY d2qual/ d2qual/
 COPY inference.py validate_predictions.py entrypoint.sh ./
 # Trained checkpoints (fold*.pt / full.pt) — produced by `python -m d2qual.train`.
-# Optional: Gemma 4 weights under model/gemma for the zero-shot fallback.
+# (The Gemma zero-shot fallback needs transformers, which this image omits on purpose.)
 COPY model/ model/
 RUN chmod +x entrypoint.sh && mkdir -p /app/input /app/output \
     && python -c "import d2qual.predict, timm, PIL; print('import ok')"

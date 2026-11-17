@@ -16,19 +16,25 @@ BACKBONE=${BACKBONE:-convnext_small.fb_in22k_ft_in1k_384}
 SIZE=${SIZE:-384}
 
 cd "$WORK"
-[ -d DARPA-D2 ] || git clone --depth 1 -b "$BRANCH" "$REPO" DARPA-D2
+if [ -d DARPA-D2 ]; then git -C DARPA-D2 pull -q --ff-only; else git clone --depth 1 -b "$BRANCH" "$REPO" DARPA-D2; fi
 cd DARPA-D2/qualification
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-pip install -q "timm==1.0.12" 2>&1 | tail -1
+# huggingface_hub + safetensors are needed to download pretrained backbone weights
+pip install -q "timm==1.0.12" huggingface_hub safetensors 2>&1 | tail -1
+python -c "import timm, huggingface_hub; print('timm', timm.__version__, 'hf_hub', huggingface_hub.__version__)" \
+  || { echo "DEPENDENCY_INSTALL_FAILED"; exit 1; }
 
 echo "== generating synthetic data $(date -u +%T)"
-python synthetic/generate.py --out data/synth/train --n 3000 --seed 1 &
-python synthetic/generate.py --out data/synth/test --n 600 --seed 424242 --prefix test_ &
+[ -f data/synth/train/labels.json ] || python synthetic/generate.py --out data/synth/train --n 3000 --seed 1 &
+[ -f data/synth/test/labels.json ] || python synthetic/generate.py --out data/synth/test --n 600 --seed 424242 --prefix test_ &
 wait
 echo "== training $(date -u +%T)"
+rm -f model/weights/*.pt
 python -m d2qual.train --images data/synth/train --labels data/synth/train/labels.json \
   --out model/weights --backbone "$BACKBONE" --size "$SIZE" --epochs "$EPOCHS" \
-  --batch 32 --lr 1e-3 --backbone-lr-mult 0.1 --folds "$FOLDS" --workers 8
+  --batch 32 --lr 1e-3 --backbone-lr-mult 0.1 --folds "$FOLDS" --workers 8 \
+  || { echo "TRAINING_FAILED - not scoring the prior fallback"; exit 1; }
+ls model/weights/*.pt >/dev/null 2>&1 || { echo "NO_CHECKPOINTS - not scoring"; exit 1; }
 
 echo "== held-out inference $(date -u +%T)"
 mkdir -p /tmp/test_in && cp data/synth/test/*.jpg data/synth/test/*.png /tmp/test_in/ 2>/dev/null

@@ -26,6 +26,9 @@ Refactor of [SecondLife](https://github.com/rmagesh-quml/SecondLife_GoogleHackat
   * The output is checked by a local copy of the JHU/APL validator.
 * **Optional Gemma 4 vision fallback** (`D2_ENABLE_VLM=1`): this reuses SecondLife's 768×768 frame contract and JSON-only prompt parsing for zero-shot answers before any training.
 
+### Proof of concept (synthetic data, RTX 4090)
+The pipeline ran end to end on 3,000 procedurally generated simulated-casualty images and was scored on 600 held-out ones. It reached **96.5% overall accuracy** (macro-F1 0.964, 5-fold CV 96.9% ± 0.8%). The prior-only fallback scores 45.9% on the same images. These are synthetic images, so this number does not predict the score on DARPA's photos. See [results/synthetic_poc_2026-11-17.md](qualification/results/synthetic_poc_2026-11-17.md) for the full breakdown. To reproduce on any GPU box, run `bash qualification/scripts/run_synthetic_poc.sh`.
+
 ### Train (on the DARPA training set, GPU machine)
 ```bash
 cd qualification

@@ -1,0 +1,38 @@
+# Model weights / checkpoints (large, baked into images at build time)
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.litertlm
+*.task
+*.tflite
+*.onnx
+sprint/models/*
+!sprint/models/.gitkeep
+qualification/model/gemma/
+
+# DARPA data — never commit (data handling agreement, Qualification Guide §4.1)
+data/darpa/
+qualification/data/
+**/train_images/
+**/input/
+**/output/
+out/
+*.jsonl
+audit_log.json
+
+# Generated demo
+sprint/examples/demo_scenario/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

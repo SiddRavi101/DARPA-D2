@@ -1,0 +1,178 @@
+"""
+Inference: /app/input/*.{jpg,jpeg,png} → /app/output/predictions.json
+
+Guarantees (each one is a way teams get disqualified):
+  * every input image gets exactly one prediction with all four sites
+  * output is always schema-valid, even if the model, CUDA or an image fails
+  * hard wall-clock budget (ICD: 1 h) — remaining images get the fallback prior
+  * no network access required
+
+Backends, in priority order:
+  1. ensemble of trained checkpoints in model/weights/*.pt (+ mirror TTA)
+  2. Gemma 4 vision zero-shot (only if D2_ENABLE_VLM=1 and weights are baked in)
+  3. per-site class prior saved in the checkpoint (or DEFAULT_FALLBACK)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Optional
+
+from .schema import (CLASSES, DEFAULT_FALLBACK, build_document, list_images, make_prediction,
+                     validate_document, write_document)
+
+log = logging.getLogger("d2qual")
+
+
+class Ensemble:
+    def __init__(self, weights_dir: Path, device):
+        import torch
+
+        from .model import load_checkpoint
+
+        self.torch = torch
+        self.device = device
+        self.members = []
+        self.fallback: list[str] = list(DEFAULT_FALLBACK)
+        for p in sorted(Path(weights_dir).glob("*.pt")):
+            try:
+                model, ckpt = load_checkpoint(p, device)
+                if device.type == "cuda":
+                    model = model.half()
+                self.members.append((p.name, model))
+                self.fallback = ckpt.get("fallback", self.fallback)
+                log.info("loaded %s (cv acc %s)", p.name, ckpt.get("metrics", {}).get("overall_accuracy"))
+            except Exception as e:  # a corrupt member must not take down the run
+                log.error("skipping checkpoint %s: %s", p, e)
+
+    def __bool__(self) -> bool:
+        return bool(self.members)
+
+    def predict_probs(self, images) -> "list[list[list[float]]]":
+        """images: list[PIL.Image] → probs [N][4][4], averaged over members × {orig, mirror}."""
+        import numpy as np
+
+        from .data import letterbox
+        from .model import flip_logits
+
+        torch = self.torch
+        total = None
+        for _, model in self.members:
+            cfg = model.cfg
+            arr = np.stack([np.asarray(letterbox(im, cfg.image_size), dtype=np.float32) for im in images]) / 255.0
+            x = torch.from_numpy(arr).permute(0, 3, 1, 2)
+            x = (x - torch.tensor(cfg.mean)[None, :, None, None]) / torch.tensor(cfg.std)[None, :, None, None]
+            x = x.to(self.device)
+            if self.device.type == "cuda":
+                x = x.half()
+            with torch.inference_mode():
+                p = model(x).float().softmax(-1)
+                p = p + flip_logits(model(torch.flip(x, dims=[3])).float()).softmax(-1)
+            total = p if total is None else total + p
+        return (total / (2 * len(self.members))).cpu().tolist()
+
+
+def _select_device():
+    import torch
+
+    if os.environ.get("D2_FORCE_CPU") != "1" and torch.cuda.is_available():
+        try:
+            torch.zeros(1, device="cuda")
+            return torch.device("cuda")
+        except Exception as e:
+            log.error("CUDA visible but unusable (%s) — falling back to CPU", e)
+    return torch.device("cpu")
+
+
+def _safe_load(path: Path):
+    from .data import load_image
+
+    try:
+        return load_image(path)
+    except Exception as e:
+        log.error("cannot decode %s: %s", path.name, e)
+        return None
+
+
+def run(input_dir: str | Path, output_path: str | Path, weights_dir: str | Path,
+        team_name: str, version: str, email: str,
+        time_budget_s: float = 50 * 60, batch_size: int = 16) -> dict:
+    t_start = time.monotonic()
+    images = list_images(input_dir)
+    log.info("%d images in %s", len(images), input_dir)
+
+    labels: dict[str, list[str]] = {}
+    fallback = list(DEFAULT_FALLBACK)
+
+    # Write a valid all-fallback file FIRST: if anything later is killed
+    # (OOM, timeout), a schema-valid predictions.json is already on disk.
+    def _flush():
+        preds = [make_prediction(p.name, labels.get(p.name, fallback)) for p in images]
+        doc = build_document(preds, team_name, version, email)
+        write_document(doc, output_path)
+        return doc
+
+    _flush()
+
+    ensemble: Optional[Ensemble] = None
+    vlm = None
+    try:
+        device = _select_device()
+        ensemble = Ensemble(Path(weights_dir), device)
+        if ensemble:
+            fallback = list(ensemble.fallback)
+        elif os.environ.get("D2_ENABLE_VLM") == "1":
+            from .vlm import GemmaVisionClassifier
+            vlm = GemmaVisionClassifier.try_load(device)
+        log.info("backend: %s on %s", "ensemble" if ensemble else ("vlm" if vlm else "prior"), device)
+    except Exception as e:
+        log.exception("backend init failed, using prior: %s", e)
+
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 2)) as pool:
+        for start in range(0, len(images), batch_size):
+            if time.monotonic() - t_start > time_budget_s:
+                log.error("time budget hit at %d/%d images — rest use prior", start, len(images))
+                break
+            chunk = images[start:start + batch_size]
+            pil = list(pool.map(_safe_load, chunk))
+            ok = [(p, im) for p, im in zip(chunk, pil) if im is not None]
+            for p, im in zip(chunk, pil):
+                if im is None:
+                    labels[p.name] = ["not_testable"] * 4  # undecodable == nothing visible
+            if not ok:
+                continue
+            try:
+                if ensemble:
+                    probs = ensemble.predict_probs([im for _, im in ok])
+                    for (p, _), pr in zip(ok, probs):
+                        labels[p.name] = [CLASSES[max(range(4), key=site.__getitem__)] for site in pr]
+                elif vlm is not None:
+                    for p, im in ok:
+                        labels[p.name] = vlm.classify(im) or fallback
+            except Exception as e:
+                log.exception("inference failed on batch at %d: %s", start, e)
+                if ensemble and getattr(ensemble.device, "type", "") == "cuda" and batch_size > 1:
+                    # most likely OOM: retry this chunk one image at a time on the same device
+                    for p, im in ok:
+                        try:
+                            pr = ensemble.predict_probs([im])[0]
+                            labels[p.name] = [CLASSES[max(range(4), key=s.__getitem__)] for s in pr]
+                        except Exception:
+                            pass
+            if (start // batch_size) % 20 == 0:
+                _flush()
+                log.info("%d/%d done (%.0fs)", min(start + batch_size, len(images)), len(images),
+                         time.monotonic() - t_start)
+
+    doc = _flush()
+    errs = validate_document(doc, [p.name for p in images])
+    if errs:  # should be impossible; never leave an invalid file behind
+        log.error("self-validation failed: %s", errs[:10])
+        doc = build_document([make_prediction(p.name, fallback) for p in images], team_name, version, email)
+        write_document(doc, output_path)
+    log.info("wrote %s (%d predictions) in %.1fs", output_path, len(images), time.monotonic() - t_start)
+    return doc

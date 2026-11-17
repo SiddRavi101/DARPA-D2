@@ -1,0 +1,12 @@
+numpy<2.3
+scipy>=1.11
+soundfile>=0.12
+faster-whisper>=1.1
+opencv-python-headless>=4.9
+# Dense RAG (falls back to BM25 if missing)
+faiss-cpu>=1.8
+fastembed>=0.4
+# Optional Gemma 4 advisor (D2_ENABLE_LLM=1)
+torch>=2.5
+transformers>=4.57
+accelerate>=1.0

@@ -198,3 +198,82 @@ def test_groups_file(tmp_path):
     p.write_text("image_id,group\na.jpg,m1\nb,m1\n")
     g = load_groups(["a.jpg", "b.PNG", "c.jpg"], groups_file=str(p))
     assert g["a.jpg"] == g["b.PNG"] == "m1" and g["c.jpg"].startswith("__single__")
+
+
+# ── pose-guided limb crops ────────────────────────────────────────────────────
+
+def _fake_kps(w=200, h=160):
+    """A casualty lying face-up, head at the top: its LEFT side is on the image RIGHT."""
+    import numpy as np
+
+    k = np.zeros((17, 3), np.float32)
+    pts = {5: (120, 40), 6: (80, 40), 7: (150, 60), 8: (50, 60), 9: (175, 80), 10: (25, 80),
+           11: (112, 90), 12: (88, 90), 13: (125, 120), 14: (75, 120), 15: (130, 150), 16: (70, 150)}
+    for i, (x, y) in pts.items():
+        k[i] = (x * w / 200, y * h / 160, 0.9)
+    return k
+
+
+def test_unrotate_maps_points_back():
+    import numpy as np
+
+    from d2qual.pose import _unrotate
+
+    img = Image.new("RGB", (120, 80))
+    pt = np.array([[30.0, 20.0]])
+    img.putpixel((30, 20), (255, 255, 255))
+    for rot in (90, 270):
+        r = img.rotate(rot, expand=True)
+        a = np.asarray(r).sum(-1)
+        ys, xs = np.nonzero(a)
+        back = _unrotate(np.array([[xs.mean(), ys.mean()]]), rot, img.size, r.size)
+        assert np.abs(back - pt).max() < 1.5, (rot, back)
+
+
+def test_limb_crops_follow_anatomical_side_and_mirror():
+    import numpy as np
+
+    from d2qual.data import limb_crops, mirror_limb_inputs
+
+    img = Image.new("RGB", (200, 160), (0, 0, 0))
+    for x in range(100, 200):  # paint the casualty's LEFT half (image right) red
+        for y in range(160):
+            img.putpixel((x, y), (255, 0, 0))
+    crops, feats = limb_crops(img, _fake_kps(), 32)
+    assert len(crops) == 4 and feats.shape == (4, 4) and feats[:, 3].tolist() == [1, 1, 1, 1]
+    red = [np.asarray(c)[..., 0].mean() for c in crops]
+    assert red[0] > red[1] and red[2] > red[3]  # left limbs are on the red side
+    mc, mf = mirror_limb_inputs(crops, feats)
+    # after mirroring, the "left arm" crop is the mirrored right-arm crop
+    assert np.array_equal(np.asarray(mc[0]), np.asarray(crops[1])[:, ::-1])
+    assert np.array_equal(mf, feats[[1, 0, 3, 2]])
+    blank, f0 = limb_crops(img, None, 32)
+    assert f0.sum() == 0 and len(blank) == 4
+
+
+def test_limb_crop_model_trains_and_predicts(image_dir, tmp_path):
+    pytest.importorskip("timm")
+    from d2qual import train
+    from d2qual.predict import run
+    from d2qual.review import review
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps(_doc(LABELS)))
+    kp_path = tmp_path / "kp.json"
+    kp_path.write_text(json.dumps({k: _fake_kps().tolist() for k in LABELS}))
+    wdir = tmp_path / "weights"
+    train.main(["--images", str(image_dir), "--labels", str(labels_path), "--out", str(wdir),
+                "--backbone", "resnet18", "--size", "64", "--crop-size", "32", "--epochs", "1",
+                "--batch", "2", "--folds", "2", "--workers", "0", "--no-pretrained",
+                "--limb-crops", "--keypoints", str(kp_path)])
+    assert (wdir / "oof_predictions.json").exists() and (wdir / "oof_probs.json").exists()
+    oof = load_labels(wdir / "oof_predictions.json")
+    assert set(oof) == set(LABELS)
+    # no pose weights in this test: inference must still produce a valid file (blank crops)
+    out = tmp_path / "predictions.json"
+    run(image_dir, out, wdir, "t", "1", "e@x", batch_size=3)
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert schema.validate_document(doc, [p.name for p in schema.list_images(image_dir)]) == []
+    acc = review(image_dir, labels_path, wdir / "oof_predictions.json", tmp_path / "rev",
+                 wdir / "oof_probs.json", kp_path)
+    assert 0 <= acc <= 1 and (tmp_path / "rev" / "index.html").exists()

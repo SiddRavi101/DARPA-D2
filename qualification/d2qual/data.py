@@ -214,13 +214,107 @@ def _augment(img: Image.Image, rng: random.Random) -> Image.Image:
     return img
 
 
+# ── Pose-guided limb crops ────────────────────────────────────────────────────
+# For each site, a square close-up around shoulder->elbow->wrist (or hip->knee->ankle),
+# extended past the wrist/ankle to include the hand/foot. Crops are cut from the ORIGINAL
+# image (before global augmentation), so keypoints never need re-projecting. A limb the
+# pose model can't see gets a blank crop and zero confidences: the model learns that a
+# missing limb is evidence for not_testable / amputation, and falls back to the global view.
+
+KP_CONF_MIN = 0.35
+N_KP_FEATS = 4  # [conf proximal, conf middle, conf distal, crop present]
+_FILL = (124, 116, 104)
+
+
+def _body_scale(kps) -> float:
+    import numpy as np
+
+    pairs = [(5, 11), (6, 12), (5, 6), (11, 12)]  # shoulders-hips, shoulder-shoulder, hip-hip
+    d = [float(np.hypot(*(kps[a, :2] - kps[b, :2]))) for a, b in pairs
+         if kps[a, 2] >= KP_CONF_MIN and kps[b, 2] >= KP_CONF_MIN]
+    return max(d) if d else 0.0
+
+
+def limb_boxes(kps, img_size):
+    """kps (17,3) in image pixels -> 4 boxes (x0,y0,x1,y1) or None, plus (4, N_KP_FEATS) features."""
+    import numpy as np
+
+    from .pose import KP, LIMB_CHAINS
+
+    w, h = img_size
+    scale = _body_scale(kps) or 0.25 * max(w, h)
+    boxes, feats = [], np.zeros((4, N_KP_FEATS), np.float32)
+    for s, chain in enumerate(LIMB_CHAINS):
+        idx = [KP[n] for n in chain]
+        conf = kps[idx, 2]
+        feats[s, :3] = conf
+        vis = [i for i, c in zip(idx, conf) if c >= KP_CONF_MIN]
+        if len(vis) < 2:
+            boxes.append(None)
+            continue
+        pts = kps[vis, :2].astype(np.float64)
+        if kps[idx[2], 2] >= KP_CONF_MIN and kps[idx[1], 2] >= KP_CONF_MIN:  # add the hand / foot
+            d = kps[idx[2], :2] - kps[idx[1], :2]
+            pts = np.vstack([pts, kps[idx[2], :2] + d * 0.45])
+        x0, y0 = pts.min(0)
+        x1, y1 = pts.max(0)
+        side = max(x1 - x0, y1 - y0) + 0.5 * scale
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        boxes.append((cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2))
+        feats[s, 3] = 1.0
+    return boxes, feats
+
+
+def crop_box(img: Image.Image, box, size: int, rng: Optional[random.Random] = None) -> Image.Image:
+    """Square crop (padded where it leaves the image), optionally jittered for training."""
+    if box is None:
+        return Image.new("RGB", (size, size), _FILL)
+    x0, y0, x1, y1 = box
+    if rng is not None:  # small shift / zoom; never large enough to lose the limb
+        side = x1 - x0
+        dx, dy = rng.uniform(-0.08, 0.08) * side, rng.uniform(-0.08, 0.08) * side
+        z = rng.uniform(0.92, 1.12)
+        cx, cy = (x0 + x1) / 2 + dx, (y0 + y1) / 2 + dy
+        half = side * z / 2
+        x0, y0, x1, y1 = cx - half, cy - half, cx + half, cy + half
+    # PIL pads out-of-bounds regions with black, identically at train and test time
+    return img.crop((round(x0), round(y0), round(x1), round(y1))).resize((size, size), Image.BICUBIC)
+
+
+def limb_crops(img: Image.Image, kps, size: int, rng: Optional[random.Random] = None):
+    """-> (list of 4 PIL crops in SITES order, (4, N_KP_FEATS) features)."""
+    import numpy as np
+
+    if kps is None:
+        kps = np.zeros((17, 3), np.float32)
+    boxes, feats = limb_boxes(kps, img.size)
+    return [crop_box(img, b, size, rng) for b in boxes], feats
+
+
+def mirror_limb_inputs(crops: list, feats):
+    """Mirror the photo => anatomical sides swap: permute sites and mirror each crop."""
+    return [ImageOps.mirror(crops[i]) for i in FLIP_PERMUTATION], feats[list(FLIP_PERMUTATION)]
+
+
+def to_tensor(img: Image.Image, mean, std):
+    import numpy as np
+    import torch
+
+    x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+    return (x - torch.tensor(mean)[:, None, None]) / torch.tensor(std)[:, None, None]
+
+
 # ── Torch dataset ─────────────────────────────────────────────────────────────
 
 class InjuryDataset:
-    """Map-style dataset; torch is imported lazily so schema/validator stay torch-free."""
+    """
+    Map-style dataset; torch is imported lazily so schema/validator stay torch-free.
+    Returns (x, y), or (x, crops, kp_feats, y) when `keypoints` is given (limb-crop models).
+    """
 
     def __init__(self, image_dir, labels: dict[str, list[str]], image_ids: list[str],
-                 size: int, train: bool, mean, std, seed: int = 0):
+                 size: int, train: bool, mean, std, seed: int = 0,
+                 keypoints: Optional[dict] = None, crop_size: int = 224):
         self.image_dir = Path(image_dir)
         self.labels = labels
         self.ids = image_ids
@@ -228,27 +322,50 @@ class InjuryDataset:
         self.train = train
         self.mean, self.std = mean, std
         self.rng = random.Random(seed)
+        self.keypoints = keypoints
+        self.crop_size = crop_size
 
     def __len__(self) -> int:
         return len(self.ids)
 
     def __getitem__(self, i):
-        import numpy as np
         import torch
 
         iid = self.ids[i]
-        img = load_image(self.image_dir / iid)
+        orig = load_image(self.image_dir / iid)
         lab = list(self.labels[iid])
+        crops = feats = None
+        if self.keypoints is not None:
+            crops, feats = limb_crops(orig, self.keypoints.get(iid), self.crop_size,
+                                      self.rng if self.train else None)
+        img = orig
         if self.train:
             img = _augment(img, self.rng)
+            if crops is not None:
+                crops = [_augment_crop(c, self.rng) for c in crops]
             if self.rng.random() < 0.5:
                 img = ImageOps.mirror(img)
                 lab = flip_labels(lab)
-        img = letterbox(img, self.size)
-        x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
-        x = (x - torch.tensor(self.mean)[:, None, None]) / torch.tensor(self.std)[:, None, None]
+                if crops is not None:
+                    crops, feats = mirror_limb_inputs(crops, feats)
+        x = to_tensor(letterbox(img, self.size), self.mean, self.std)
         y = torch.tensor([CLASS_TO_IDX[c] for c in lab], dtype=torch.long)
-        return x, y
+        if crops is None:
+            return x, y
+        c = torch.stack([to_tensor(cr, self.mean, self.std) for cr in crops])
+        return x, c, torch.from_numpy(feats), y
+
+
+def _augment_crop(img: Image.Image, rng: random.Random) -> Image.Image:
+    from PIL import ImageEnhance
+
+    if rng.random() < 0.8:
+        img = ImageEnhance.Brightness(img).enhance(rng.uniform(0.75, 1.25))
+        img = ImageEnhance.Contrast(img).enhance(rng.uniform(0.75, 1.25))
+        img = ImageEnhance.Color(img).enhance(rng.uniform(0.75, 1.25))
+    if rng.random() < 0.15:
+        img = img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.3, 1.2)))
+    return img
 
 
 def match_images(image_dir, labels: dict[str, list[str]]) -> dict[str, list[str]]:

@@ -8,7 +8,8 @@ Guarantees (each one is a way teams get disqualified):
   * no network access required
 
 Backends, in priority order:
-  1. ensemble of trained checkpoints in model/weights/*.pt (+ mirror TTA)
+  1. ensemble of trained checkpoints in model/weights/*.pt (+ mirror TTA); limb-crop
+     checkpoints also get pose keypoints from model/pose/ (baked in, never downloaded)
   2. Gemma 4 vision zero-shot (only if D2_ENABLE_VLM=1 and weights are baked in)
   3. per-site class prior saved in the checkpoint (or DEFAULT_FALLBACK)
 """
@@ -38,6 +39,7 @@ class Ensemble:
         self.device = device
         self.members = []
         self.fallback: list[str] = list(DEFAULT_FALLBACK)
+        self.pose = None
         for p in sorted(Path(weights_dir).glob("*.pt")):
             try:
                 model, ckpt = load_checkpoint(p, device)
@@ -48,30 +50,47 @@ class Ensemble:
                 log.info("loaded %s (cv acc %s)", p.name, ckpt.get("metrics", {}).get("overall_accuracy"))
             except Exception as e:  # a corrupt member must not take down the run
                 log.error("skipping checkpoint %s: %s", p, e)
+        if any(m.cfg.limb_crops for _, m in self.members):
+            from .pose import PoseExtractor
+
+            self.pose = PoseExtractor.try_load(weights_dir, device)
+            if self.pose is None:  # limb models still run, on blank crops (global view only)
+                log.error("limb-crop checkpoints without a pose model: accuracy will drop")
 
     def __bool__(self) -> bool:
         return bool(self.members)
 
     def predict_probs(self, images) -> "list[list[list[float]]]":
-        """images: list[PIL.Image] → probs [N][4][4], averaged over members × {orig, mirror}."""
-        import numpy as np
-
-        from .data import letterbox
-        from .model import flip_logits
+        """images: list[PIL.Image] -> probs [N][4][4], averaged over members x {orig, mirror}."""
+        from .data import letterbox, limb_crops, to_tensor
+        from .model import flip_logits, mirror_inputs
 
         torch = self.torch
+        half = self.device.type == "cuda"
+        keypoints = None
+        if any(m.cfg.limb_crops for _, m in self.members):
+            keypoints = [None] * len(images)
+            if self.pose is not None:
+                try:
+                    keypoints = self.pose.extract(images)
+                except Exception as e:  # pose failure must not kill the batch
+                    log.error("pose extraction failed (%s); using blank limb crops", e)
         total = None
         for _, model in self.members:
             cfg = model.cfg
-            arr = np.stack([np.asarray(letterbox(im, cfg.image_size), dtype=np.float32) for im in images]) / 255.0
-            x = torch.from_numpy(arr).permute(0, 3, 1, 2)
-            x = (x - torch.tensor(cfg.mean)[None, :, None, None]) / torch.tensor(cfg.std)[None, :, None, None]
-            x = x.to(self.device)
-            if self.device.type == "cuda":
-                x = x.half()
+            x = torch.stack([to_tensor(letterbox(im, cfg.image_size), cfg.mean, cfg.std) for im in images])
+            crops = kpf = None
+            if cfg.limb_crops:
+                cs, fs = zip(*(limb_crops(im, kp, cfg.crop_size) for im, kp in zip(images, keypoints)))
+                crops = torch.stack([torch.stack([to_tensor(c, cfg.mean, cfg.std) for c in four]) for four in cs])
+                kpf = torch.stack([torch.from_numpy(f) for f in fs])
+            x = x.to(self.device).half() if half else x.to(self.device)
+            if crops is not None:
+                crops = crops.to(self.device).half() if half else crops.to(self.device)
+                kpf = kpf.to(self.device).half() if half else kpf.to(self.device)
             with torch.inference_mode():
-                p = model(x).float().softmax(-1)
-                p = p + flip_logits(model(torch.flip(x, dims=[3])).float()).softmax(-1)
+                p = model(x, crops, kpf).float().softmax(-1)
+                p = p + flip_logits(model(*mirror_inputs(x, crops, kpf)).float()).softmax(-1)
             total = p if total is None else total + p
         return (total / (2 * len(self.members))).cpu().tolist()
 

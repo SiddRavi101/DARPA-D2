@@ -26,8 +26,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .data import InjuryDataset, class_prior, load_labels, match_images
-from .model import InjuryNet, ModelConfig, flip_logits, save_checkpoint
-from .schema import CLASSES, SITE_KEYS
+from .model import InjuryNet, ModelConfig, flip_logits, mirror_inputs, save_checkpoint
+from .schema import CLASSES, SITE_KEYS, build_document, make_prediction
 
 
 def set_seed(seed: int) -> None:
@@ -118,41 +118,64 @@ def grouped_folds(ids: list[str], labels: dict[str, list[str]], groups: dict[str
     return folds
 
 
+def _unpack(batch, device):
+    """(x, y) or (x, crops, kp_feats, y) -> (model inputs, targets)."""
+    *inputs, y = [t.to(device, non_blocking=True) for t in batch]
+    if len(inputs) == 1:
+        inputs += [None, None]
+    return inputs, y
+
+
+def predict_probs(model, inputs, tta: bool = True):
+    x, crops, kpf = inputs
+    p = model(x, crops, kpf).float().softmax(-1)
+    if tta:
+        p = p + flip_logits(model(*mirror_inputs(x, crops, kpf)).float()).softmax(-1)
+    return p
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, tta: bool = True) -> dict:
+def evaluate(model, loader, device, tta: bool = True, return_probs: bool = False) -> dict:
     model.eval()
     correct = total = 0
     per_site = np.zeros(4)
     conf = np.zeros((len(CLASSES), len(CLASSES)), dtype=int)
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
+    all_probs = []
+    for batch in loader:
+        inputs, y = _unpack(batch, device)
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-            logits = model(x).float()
-            if tta:
-                logits = logits.softmax(-1) + flip_logits(model(torch.flip(x, dims=[3])).float()).softmax(-1)
-        pred = logits.argmax(-1)
+            probs = predict_probs(model, inputs, tta)
+        pred = probs.argmax(-1)
+        if return_probs:
+            all_probs.append((probs / probs.sum(-1, keepdim=True)).cpu())
         correct += (pred == y).sum().item()
         total += y.numel()
         per_site += (pred == y).sum(0).cpu().numpy()
         for t, p in zip(y.flatten().tolist(), pred.flatten().tolist()):
             conf[t, p] += 1
     n_img = max(1, total // 4)
-    return {
+    out = {
         "overall_accuracy": correct / max(1, total),
         "per_site_accuracy": {k: per_site[i] / n_img for i, k in enumerate(SITE_KEYS)},
         "confusion": {"labels": list(CLASSES), "matrix": conf.tolist()},
     }
+    if return_probs:
+        out["probs"] = torch.cat(all_probs).numpy() if all_probs else np.zeros((0, 4, 4))
+    return out
 
 
-def train_one(args, train_ids, val_ids, labels, out_path: Path, device) -> dict:
-    cfg = ModelConfig(backbone=args.backbone, image_size=args.size)
+def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoints=None) -> dict:
+    cfg = ModelConfig(backbone=args.backbone, image_size=args.size,
+                      limb_crops=keypoints is not None, crop_size=args.crop_size)
     model = InjuryNet(cfg, pretrained=not args.no_pretrained).to(device)
     data_cfg = getattr(model.backbone, "pretrained_cfg", {}) or {}
     cfg.mean = tuple(data_cfg.get("mean", cfg.mean))
     cfg.std = tuple(data_cfg.get("std", cfg.std))
 
-    tr = InjuryDataset(args.images, labels, train_ids, cfg.image_size, True, cfg.mean, cfg.std, args.seed)
-    va = InjuryDataset(args.images, labels, val_ids, cfg.image_size, False, cfg.mean, cfg.std)
+    tr = InjuryDataset(args.images, labels, train_ids, cfg.image_size, True, cfg.mean, cfg.std, args.seed,
+                       keypoints=keypoints, crop_size=cfg.crop_size)
+    va = InjuryDataset(args.images, labels, val_ids, cfg.image_size, False, cfg.mean, cfg.std,
+                       keypoints=keypoints, crop_size=cfg.crop_size)
     tl = DataLoader(tr, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                     drop_last=len(tr) > args.batch, pin_memory=device.type == "cuda",
                     persistent_workers=args.workers > 0)
@@ -176,10 +199,10 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device) -> dict:
     for epoch in range(args.epochs):
         model.train()
         t0, running = time.time(), 0.0
-        for x, y in tl:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        for batch in tl:
+            inputs, y = _unpack(batch, device)
             with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-                logits = model(x)
+                logits = model(*inputs)
                 loss = crit(logits.float().reshape(-1, len(CLASSES)), y.reshape(-1))
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -191,10 +214,11 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device) -> dict:
             running += loss.item()
         msg = f"epoch {epoch + 1}/{args.epochs} loss {running / max(1, len(tl)):.4f} ({time.time() - t0:.0f}s)"
         if vl is not None:
-            m = evaluate(model, vl, device)
+            m = evaluate(model, vl, device, return_probs=True)
+            probs = m.pop("probs")
             msg += f" val_acc {m['overall_accuracy']:.4f}"
             if m["overall_accuracy"] > best["overall_accuracy"]:
-                best = m
+                best = {**m, "oof": {iid: pr.tolist() for iid, pr in zip(val_ids, probs)}}
                 save_checkpoint(out_path, model, fallback, {**m, "epoch": epoch + 1})
                 msg += " *"
         print(msg, flush=True)
@@ -226,6 +250,11 @@ def main(argv=None) -> None:
     ap.add_argument("--group-regex", default=None,
                     help="regex on image_id; first capture group = scene/manikin id (grouped CV)")
     ap.add_argument("--groups-file", default=None, help="CSV image_id,group for grouped CV")
+    ap.add_argument("--limb-crops", action="store_true",
+                    help="pose-guided limb crops (runs the pose model once and caches keypoints)")
+    ap.add_argument("--crop-size", type=int, default=224)
+    ap.add_argument("--keypoints", default=None,
+                    help="keypoint cache JSON (default <out>/keypoints.json; built if missing)")
     args = ap.parse_args(argv)
 
     set_seed(args.seed)
@@ -239,9 +268,18 @@ def main(argv=None) -> None:
         print(f"  {key:24s} {dict(Counter(v[s] for v in labels.values()))}")
 
     out = Path(args.out)
+    keypoints = None
+    if args.limb_crops:
+        from .pose import build_cache
+
+        kp_path = Path(args.keypoints) if args.keypoints else out / "keypoints.json"
+        keypoints = build_cache(args.images, ids, kp_path, device=device)
+        found = [sum(float(keypoints[i][j, 2]) >= 0.35 for i in ids) / len(ids) for j in (9, 10, 15, 16)]
+        print("limb crops: share of images with wrist/ankle found (L arm, R arm, L leg, R leg):",
+              " ".join(f"{f:.2f}" for f in found))
     results = {}
     if args.folds <= 1:
-        results["full"] = train_one(args, ids, [], labels, out / "full.pt", device)
+        results["full"] = train_one(args, ids, [], labels, out / "full.pt", device, keypoints)
     else:
         groups = load_groups(ids, args.group_regex, args.groups_file)
         if groups:
@@ -261,10 +299,22 @@ def main(argv=None) -> None:
             val = folds[i]
             trn = [x for j, f in enumerate(folds) if j != i for x in f]
             print(f"-- fold {i} ({len(trn)} train / {len(val)} val)")
-            results[f"fold{i}"] = train_one(args, trn, val, labels, out / f"fold{i}.pt", device)
+            results[f"fold{i}"] = train_one(args, trn, val, labels, out / f"fold{i}.pt", device, keypoints)
         accs = [r["overall_accuracy"] for r in results.values() if r.get("overall_accuracy") is not None]
         if accs:
             print(f"CV overall accuracy: {np.mean(accs):.4f} +/- {np.std(accs):.4f}")
+        # Out-of-fold predictions: every image predicted by the one fold that never trained on it.
+        # d2qual.review turns these into contact sheets of the model's mistakes.
+        oof = {iid: pr for r in results.values() for iid, pr in r.pop("oof", {}).items()}
+        if oof:
+            preds = [make_prediction(iid, [CLASSES[int(np.argmax(site))] for site in pr])
+                     for iid, pr in sorted(oof.items())]
+            doc = build_document(preds, "oof", "cv", "oof@example.com")
+            (out / "oof_predictions.json").write_text(json.dumps(doc, indent=1))
+            (out / "oof_probs.json").write_text(json.dumps({k: np.round(v, 4).tolist() for k, v in oof.items()}))
+            print(f"out-of-fold predictions for {len(oof)} images -> {out / 'oof_predictions.json'}")
+    for r in results.values():
+        r.pop("oof", None)
     (out / "train_report.json").write_text(json.dumps(results, indent=2, default=float))
 
 

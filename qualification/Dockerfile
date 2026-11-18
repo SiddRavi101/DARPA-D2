@@ -27,9 +27,10 @@ RUN pip install --no-cache-dir -r requirements.txt && rm -rf /root/.cache
 COPY d2qual/ d2qual/
 COPY inference.py validate_predictions.py entrypoint.sh ./
 # Trained checkpoints (fold*.pt / full.pt) — produced by `python -m d2qual.train`.
+# Limb-crop checkpoints also need model/pose/keypointrcnn.pth (submit.sh adds it).
 # (The Gemma zero-shot fallback needs transformers, which this image omits on purpose.)
 COPY model/ model/
 RUN chmod +x entrypoint.sh && mkdir -p /app/input /app/output \
-    && python -c "import d2qual.predict, timm, PIL; print('import ok')"
+    && python -c "import d2qual.predict, d2qual.pose, timm, torchvision, PIL; print('import ok')"
 
 ENTRYPOINT ["/app/entrypoint.sh"]

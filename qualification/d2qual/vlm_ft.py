@@ -102,7 +102,7 @@ class VLMClassifier:
             from PIL import Image
 
             dummy = Image.new("RGB", (self.image_size, self.image_size))
-            enc = self.processor(text=self.prompts, images=[dummy] * 4, padding=True, return_tensors="pt")
+            enc = self.processor(text=list(self.prompts), images=[dummy] * 4, padding=True, return_tensors="pt")
             self._tmpl = (enc["input_ids"], enc["attention_mask"], enc["image_grid_thw"][:1])
         return self._tmpl
 

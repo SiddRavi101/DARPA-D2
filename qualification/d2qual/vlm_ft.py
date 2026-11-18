@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -83,36 +84,96 @@ class VLMClassifier:
             self.model.eval()
 
     # ── core ────────────────────────────────────────────────────────────────────
-    def _inputs(self, images):
+    # Fast path (2026-11-19). The naive `model(**processor(text, images))` call was ~10x too slow:
+    #  * transformers 4.51 Qwen2-VL "sdpa" vision attention builds ONE (P x P) mask over the patches
+    #    of every image in the batch, so cost grew with the square of the batch size;
+    #  * each photo went through the vision tower 4x (once per limb question) and again per adapter;
+    #  * qwen2_vl has no `logits_to_keep` in 4.51, so full-vocabulary logits were computed for every
+    #    token (~6 GB per batch).
+    # Now: vision tower once per photo (one photo per call), image embeddings reused for the 4
+    # questions and for every adapter, and only the 4 answer-letter logits at the last position.
+    def _core(self):
+        m = self.model
+        return m.get_base_model() if hasattr(m, "get_base_model") else m
+
+    def _text_template(self):
+        """Tokenized 4 prompts with the image placeholder already expanded (fixed image size)."""
+        if not hasattr(self, "_tmpl"):
+            from PIL import Image
+
+            dummy = Image.new("RGB", (self.image_size, self.image_size))
+            enc = self.processor(text=self.prompts, images=[dummy] * 4, padding=True, return_tensors="pt")
+            self._tmpl = (enc["input_ids"], enc["attention_mask"], enc["image_grid_thw"][:1])
+        return self._tmpl
+
+    def encode(self, images):
+        """Vision tower once per photo -> dict reusable across questions, adapters (no LoRA in vision)."""
+        from .data import letterbox
+
+        torch = self.torch
+        core = self._core()
+        sq = [letterbox(im, self.image_size) for im in images]
+        pix = self.processor.image_processor(images=sq, return_tensors="pt")
+        thw = pix["image_grid_thw"].to(self.device)
+        pv = pix["pixel_values"].to(self.device, core.visual.get_dtype())
+        per = int(thw[0].prod())
+        with torch.no_grad():  # vision tower is frozen (LoRA only targets the LLM)
+            emb = torch.cat([core.visual(pv[i * per:(i + 1) * per], grid_thw=thw[i:i + 1]) for i in range(len(sq))])
+        return {"n": len(sq), "image_embeds": emb.view(len(sq), -1, emb.shape[-1]), "thw": thw}
+
+    def logits_from(self, enc):
+        """-> tensor (N, 4 sites, 4 classes) of answer-letter logits."""
+        torch = self.torch
+        core = self._core()
+        ids, mask, thw1 = self._text_template()
+        n = enc["n"]
+        input_ids = ids.repeat(n, 1).to(self.device)            # image-major: 4 questions per image
+        attn = mask.repeat(n, 1).to(self.device)
+        thw = thw1.to(self.device).repeat(4 * n, 1)
+        tok = core.model.embed_tokens(input_ids)
+        img = enc["image_embeds"].to(tok.dtype).repeat_interleave(4, dim=0).reshape(-1, tok.shape[-1])
+        is_img = (input_ids == core.config.image_token_id).unsqueeze(-1).expand_as(tok)
+        tok = tok.masked_scatter(is_img, img)
+        pos, _ = core.get_rope_index(input_ids, thw, None, attn)
+        hidden = core.model(input_ids=None, attention_mask=attn, position_ids=pos, inputs_embeds=tok,
+                            use_cache=False).last_hidden_state[:, -1]
+        w = core.lm_head.weight[self.letter_ids]
+        logits = (hidden.to(w.dtype) @ w.T).float()
+        return logits.view(n, 4, len(LETTERS))
+
+    def letter_logits(self, images):
+        return self.logits_from(self.encode(images))
+
+    def letter_logits_reference(self, images):
+        """Original slow path, kept only to check the fast path gives the same numbers."""
         from .data import letterbox
 
         sq = [letterbox(im, self.image_size) for im in images]
-        texts = [p for _ in sq for p in self.prompts]          # image-major: 4 questions per image
+        texts = [p for _ in sq for p in self.prompts]
         ims = [im for im in sq for _ in range(4)]
-        enc = self.processor(text=texts, images=ims, padding=True, return_tensors="pt")
-        return {k: v.to(self.device) for k, v in enc.items()}
+        enc = {k: v.to(self.device) for k, v in self.processor(text=texts, images=ims, padding=True,
+                                                               return_tensors="pt").items()}
+        out = self.model(**enc, use_cache=False)
+        return out.logits[:, -1, :][:, self.letter_ids].float().view(len(images), 4, len(LETTERS))
 
-    def letter_logits(self, images):
-        """-> tensor (N, 4 sites, 4 classes) of logits at the answer position."""
-        enc = self._inputs(images)
-        try:
-            out = self.model(**enc, logits_to_keep=1, use_cache=False)
-        except TypeError:  # older transformers without logits_to_keep
-            out = self.model(**enc, use_cache=False)
-        logits = out.logits[:, -1, :][:, self.letter_ids].float()
-        return logits.view(len(images), 4, len(LETTERS))
-
-    def predict_probs(self, images, tta: bool = True):
+    def encode_views(self, images, tta: bool = True):
         from PIL import ImageOps
 
-        torch = self.torch
-        with torch.inference_mode():
-            p = self.letter_logits(images).softmax(-1)
-            if tta:
-                pm = self.letter_logits([ImageOps.mirror(im) for im in images]).softmax(-1)
-                p = p + pm[:, list(FLIP_PERMUTATION)]
-                p = p / 2
+        views = [self.encode(images)]
+        if tta:
+            views.append(self.encode([ImageOps.mirror(im) for im in images]))
+        return views
+
+    def probs_from(self, views):
+        p = self.logits_from(views[0]).softmax(-1)
+        if len(views) > 1:
+            pm = self.logits_from(views[1]).softmax(-1)
+            p = (p + pm[:, list(FLIP_PERMUTATION)]) / 2
         return p
+
+    def predict_probs(self, images, tta: bool = True):
+        with self.torch.inference_mode():
+            return self.probs_from(self.encode_views(images, tta))
 
 
 # ── training (one fold) ─────────────────────────────────────────────────────────
@@ -242,12 +303,15 @@ class VLMEnsemble:
             self.names.append(name)
         self.clf.model = pm.eval()
         self.fallback = metas[0].get("fallback")
+        self.tta = os.environ.get("D2_VLM_TTA", "1") != "0"
         log.info("vlm members %s on base %s", self.names, base)
 
     def member_probs(self, images):
         """-> list of (name, probs tensor (N,4,4)) one per adapter."""
         out = []
-        for name in self.names:
-            self.clf.model.set_adapter(name)
-            out.append((name, self.clf.predict_probs(images)))
+        with self.clf.torch.inference_mode():
+            views = self.clf.encode_views(images, self.tta)  # vision once, shared by every adapter
+            for name in self.names:
+                self.clf.model.set_adapter(name)
+                out.append((name, self.clf.probs_from(views)))
         return out

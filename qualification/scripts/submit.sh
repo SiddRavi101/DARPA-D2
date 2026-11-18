@@ -15,6 +15,11 @@ ls model/weights/*.pt >/dev/null 2>&1 || { echo "No trained checkpoints in model
 if python -c "import glob,sys,torch; sys.exit(0 if any(torch.load(p,map_location='cpu',weights_only=False)['config'].get('limb_crops') for p in glob.glob('model/weights/*.pt')) else 1)"; then
   [ -f model/pose/keypointrcnn.pth ] || python -m d2qual.pose --save-weights model/pose/keypointrcnn.pth
 fi
+# VLM members need their base model baked in (Apache-2.0 Qwen2-VL-2B by default).
+if ls model/weights/*/vlm_meta.json >/dev/null 2>&1 && [ ! -f model/vlm_base/config.json ]; then
+  BASE=$(python -c "import glob,json;print(json.load(open(glob.glob('model/weights/*/vlm_meta.json')[0]))['base'])")
+  python -c "import sys;from huggingface_hub import snapshot_download;snapshot_download(sys.argv[1],local_dir='model/vlm_base')" "$BASE"
+fi
 
 docker build -t "$IMAGE" --build-arg TEAM_NAME="$TEAM" --build-arg CONTACT_EMAIL="$EMAIL" \
   --build-arg SUBMISSION_VERSION="$TAG" .

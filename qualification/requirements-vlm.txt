@@ -1,0 +1,7 @@
+# Only needed when the ensemble contains a fine-tuned VLM member (d2qual/vlm_ft.py).
+# The Dockerfile installs this automatically if model/weights has a vlm_meta.json.
+# transformers 4.51 needs huggingface_hub >= 0.30; still < 2, which timm 1.0.12 requires.
+transformers==4.51.3
+peft==0.15.2
+accelerate==1.6.0
+huggingface_hub==0.30.2

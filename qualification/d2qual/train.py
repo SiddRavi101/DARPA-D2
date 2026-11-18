@@ -165,6 +165,11 @@ def evaluate(model, loader, device, tta: bool = True, return_probs: bool = False
 
 
 def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoints=None) -> dict:
+    if args.backbone.startswith("vlm:"):  # fine-tuned vision-language candidate (d2qual/vlm_ft.py)
+        from .vlm_ft import train_vlm
+
+        fallback = class_prior({i: labels[i] for i in train_ids})
+        return train_vlm(args, train_ids, val_ids, labels, out_path.parent / f"vlm_{out_path.stem}", device, fallback)
     cfg = ModelConfig(backbone=args.backbone, image_size=args.size,
                       limb_crops=keypoints is not None, crop_size=args.crop_size)
     model = InjuryNet(cfg, pretrained=not args.no_pretrained).to(device)
@@ -253,6 +258,7 @@ def main(argv=None) -> None:
     ap.add_argument("--limb-crops", action="store_true",
                     help="pose-guided limb crops (runs the pose model once and caches keypoints)")
     ap.add_argument("--crop-size", type=int, default=224)
+    ap.add_argument("--vlm-size", type=int, default=448, help="square input size for vlm:<model> backbones")
     ap.add_argument("--keypoints", default=None,
                     help="keypoint cache JSON (default <out>/keypoints.json; built if missing)")
     args = ap.parse_args(argv)

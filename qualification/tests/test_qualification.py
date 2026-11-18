@@ -277,3 +277,63 @@ def test_limb_crop_model_trains_and_predicts(image_dir, tmp_path):
     acc = review(image_dir, labels_path, wdir / "oof_predictions.json", tmp_path / "rev",
                  wdir / "oof_probs.json", kp_path)
     assert 0 <= acc <= 1 and (tmp_path / "rev" / "index.html").exists()
+
+
+# ── bake-off, COCO proxy, VLM plumbing ─────────────────────────────────────────
+
+def test_bakeoff_run_leaderboard_assemble_predict(image_dir, tmp_path, monkeypatch):
+    pytest.importorskip("timm")
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import bakeoff
+    from d2qual.predict import run
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps(_doc(LABELS)))
+    tiny = ["--backbone", "resnet18", "--size", "64", "--no-pretrained"]
+    monkeypatch.setattr(bakeoff, "CANDIDATES", {"a": tiny, "b": tiny + ["--lr", "3e-3"]})
+    runs = tmp_path / "runs"
+    bakeoff.main(["run", "--images", str(image_dir), "--labels", str(labels_path), "--runs", str(runs),
+                  "--candidates", "a,b", "--folds", "2", "--epochs", "1", "--batch", "2", "--workers", "0"])
+    assert (runs / "a" / "oof_probs.json").exists() and (runs / "b" / "oof_probs.json").exists()
+    bakeoff.main(["leaderboard", "--images", str(image_dir), "--labels", str(labels_path), "--runs", str(runs)])
+    choice = json.loads((runs / "ensemble_choice.json").read_text())
+    assert abs(sum(choice["weights"].values()) - 1) < 1e-6
+    wdir = tmp_path / "weights"
+    bakeoff.main(["assemble", "--runs", str(runs), "--out", str(wdir)])
+    ens = json.loads((wdir / "ensemble.json").read_text())["weights"]
+    assert ens and all((wdir / m).exists() for m in ens)
+    out = tmp_path / "predictions.json"
+    run(image_dir, out, wdir, "t", "1", "e@x", batch_size=3)
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert schema.validate_document(doc, [p.name for p in schema.list_images(image_dir)]) == []
+
+
+def test_coco_proxy_limb_rule():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from build_coco_proxy import limb_label
+
+    crop = (0, 0, 100, 100)
+    assert limb_label([(10, 10, 2), (20, 20, 2), (30, 30, 0)], crop) == "no_injury"
+    assert limb_label([(10, 10, 2), (20, 20, 1), (30, 30, 0)], crop) == "not_testable"     # occluded
+    assert limb_label([(10, 10, 2), (150, 20, 2), (160, 30, 2)], crop) == "not_testable"   # cut out of frame
+
+
+def test_vlm_questions_name_anatomical_sides():
+    from d2qual.vlm_ft import LETTERS, _question
+
+    assert len(LETTERS) == len(schema.CLASSES)
+    q = [_question(s) for s in range(4)]
+    assert "LEFT ARM" in q[0] and "casualty's own left" in q[0]
+    assert "RIGHT LEG" in q[3] and "not the viewer's right" in q[3]
+
+
+def test_vlm_members_skipped_on_cpu_but_output_valid(image_dir, tmp_path):
+    from d2qual.predict import run
+
+    wdir = tmp_path / "weights"
+    (wdir / "x__vlm_fold0").mkdir(parents=True)
+    (wdir / "x__vlm_fold0" / "vlm_meta.json").write_text(json.dumps({"format": "d2qual-vlm-v1", "base": "none"}))
+    out = tmp_path / "predictions.json"
+    run(image_dir, out, wdir, "t", "1", "e@x", batch_size=3)  # CPU in tests: VLM skipped, prior used
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert schema.validate_document(doc, [p.name for p in schema.list_images(image_dir)]) == []

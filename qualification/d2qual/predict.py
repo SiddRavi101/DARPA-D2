@@ -30,7 +30,16 @@ log = logging.getLogger("d2qual")
 
 
 class Ensemble:
+    """
+    Members: every *.pt checkpoint (CNN / ViT, optionally limb-crop) and every sub-folder
+    with vlm_meta.json (LoRA adapter on a shared, baked-in VLM base in model/vlm_base/).
+    Weights come from weights_dir/ensemble.json ({"weights": {member: w}}) written by
+    scripts/leaderboard.py; without it every member counts equally.
+    """
+
     def __init__(self, weights_dir: Path, device):
+        import json
+
         import torch
 
         from .model import load_checkpoint
@@ -40,7 +49,13 @@ class Ensemble:
         self.members = []
         self.fallback: list[str] = list(DEFAULT_FALLBACK)
         self.pose = None
-        for p in sorted(Path(weights_dir).glob("*.pt")):
+        self.vlm = None
+        weights_dir = Path(weights_dir)
+        wfile = weights_dir / "ensemble.json"
+        self.weights = json.loads(wfile.read_text())["weights"] if wfile.exists() else None
+        for p in sorted(weights_dir.glob("*.pt")):
+            if self.weights is not None and self.weights.get(p.name, 0) <= 0:
+                continue
             try:
                 model, ckpt = load_checkpoint(p, device)
                 if device.type == "cuda":
@@ -50,6 +65,20 @@ class Ensemble:
                 log.info("loaded %s (cv acc %s)", p.name, ckpt.get("metrics", {}).get("overall_accuracy"))
             except Exception as e:  # a corrupt member must not take down the run
                 log.error("skipping checkpoint %s: %s", p, e)
+        vlm_dirs = [d for d in sorted(weights_dir.iterdir()) if (d / "vlm_meta.json").exists()
+                    and (self.weights is None or self.weights.get(d.name, 0) > 0)]
+        if vlm_dirs:
+            if device.type != "cuda":  # a 2B VLM on CPU would blow the 1-hour budget
+                log.error("skipping %d VLM members: no GPU", len(vlm_dirs))
+            else:
+                try:
+                    from .vlm_ft import VLMEnsemble
+
+                    self.vlm = VLMEnsemble(vlm_dirs, device, weights_dir.parent / "vlm_base")
+                    if not self.members and self.vlm.fallback:
+                        self.fallback = list(self.vlm.fallback)
+                except Exception as e:
+                    log.exception("VLM members failed to load (%s); continuing without them", e)
         if any(m.cfg.limb_crops for _, m in self.members):
             from .pose import PoseExtractor
 
@@ -58,10 +87,13 @@ class Ensemble:
                 log.error("limb-crop checkpoints without a pose model: accuracy will drop")
 
     def __bool__(self) -> bool:
-        return bool(self.members)
+        return bool(self.members) or self.vlm is not None
+
+    def _w(self, name: str) -> float:
+        return 1.0 if self.weights is None else float(self.weights.get(name, 0.0))
 
     def predict_probs(self, images) -> "list[list[list[float]]]":
-        """images: list[PIL.Image] -> probs [N][4][4], averaged over members x {orig, mirror}."""
+        """images: list[PIL.Image] -> probs [N][4][4], weighted mean over members x {orig, mirror}."""
         from .data import letterbox, limb_crops, to_tensor
         from .model import flip_logits, mirror_inputs
 
@@ -75,8 +107,8 @@ class Ensemble:
                     keypoints = self.pose.extract(images)
                 except Exception as e:  # pose failure must not kill the batch
                     log.error("pose extraction failed (%s); using blank limb crops", e)
-        total = None
-        for _, model in self.members:
+        total, wsum = None, 0.0
+        for name, model in self.members:
             cfg = model.cfg
             x = torch.stack([to_tensor(letterbox(im, cfg.image_size), cfg.mean, cfg.std) for im in images])
             crops = kpf = None
@@ -90,9 +122,22 @@ class Ensemble:
                 kpf = kpf.to(self.device).half() if half else kpf.to(self.device)
             with torch.inference_mode():
                 p = model(x, crops, kpf).float().softmax(-1)
-                p = p + flip_logits(model(*mirror_inputs(x, crops, kpf)).float()).softmax(-1)
-            total = p if total is None else total + p
-        return (total / (2 * len(self.members))).cpu().tolist()
+                p = (p + flip_logits(model(*mirror_inputs(x, crops, kpf)).float()).softmax(-1)) / 2
+            w = self._w(name)
+            total = p * w if total is None else total + p * w
+            wsum += w
+        if self.vlm is not None:
+            try:
+                for name, p in self.vlm.member_probs(images):
+                    w = self._w(name)
+                    p = p.to(total.device if total is not None else p.device).float()
+                    total = p * w if total is None else total + p * w
+                    wsum += w
+            except Exception as e:  # keep the CNN result if the VLM fails mid-run
+                log.exception("VLM inference failed on a batch: %s", e)
+        if total is None or wsum <= 0:
+            raise RuntimeError("no ensemble member produced output")
+        return (total / wsum).cpu().tolist()
 
 
 def _select_device():

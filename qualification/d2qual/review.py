@@ -55,11 +55,12 @@ def _thumb(path: Path, site_idx: int, caption: str, kps=None) -> Image.Image:
     s = THUMB / max(img.size)
     img = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))))
     canvas = Image.new("RGB", (THUMB, THUMB + 34), (25, 25, 25))
-    canvas.paste(img, ((THUMB - img.width) // 2, 0))
+    ox, oy = (THUMB - img.width) // 2, (THUMB - img.height) // 2  # centre the photo above the caption
+    canvas.paste(img, (ox, oy))
     d = ImageDraw.Draw(canvas)
     if box is not None:
-        ox = (THUMB - img.width) // 2
-        d.rectangle([box[0] * s + ox, box[1] * s, box[2] * s + ox, box[3] * s], outline=(255, 220, 0), width=3)
+        d.rectangle([box[0] * s + ox, box[1] * s + oy, box[2] * s + ox, box[3] * s + oy],
+                    outline=(255, 220, 0), width=3)
     for k, line in enumerate(caption.split("\n")[:2]):
         d.text((4, THUMB + 3 + 15 * k), line, fill=(235, 235, 235))
     return canvas

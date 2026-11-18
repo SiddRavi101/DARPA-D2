@@ -41,6 +41,18 @@ python -m d2qual.train --images /data/d2/train/images --labels /data/d2/train/la
 
 Install training dependencies with `pip install -r requirements-train.txt`. The submission image uses the slimmer, exactly pinned `requirements.txt`.
 
+**Pose-guided limb crops (optional; keep only if grouped CV improves):** add `--limb-crops`. A pose model (torchvision Keypoint R-CNN, searched at 0/90/270° for lying casualties) finds each limb and its anatomical side. The model then sees the whole image plus a close-up of every limb. Keypoints are cached in `<out>/keypoints.json`. `scripts/submit.sh` bakes the pose weights into `model/pose/` automatically. See [results/gpu_checks_2026-11-18.md](qualification/results/gpu_checks_2026-11-18.md).
+
+**Review the mistakes:** training writes out-of-fold predictions. Then run:
+```bash
+python -m d2qual.review --images /data/d2/train/images --labels /data/d2/train/labels.json \
+    --pred model/weights/oof_predictions.json --probs model/weights/oof_probs.json \
+    --keypoints model/weights/keypoints.json --out review/
+```
+Open `review/index.html` to page through contact sheets of each mistake type, with the most confident mistakes first (often label errors) and the limb boxed. It also counts left/right swaps. Keep `review/` local: it contains DARPA images.
+
+**Backbone fit check:** `python scripts/fit_check.py --test-images N` measures memory and speed for each candidate against the 16 GB / 1 h limits.
+
 The label loader accepts several layouts: an ICD-style `predictions.json`, a bare prediction list, JSONL, a long CSV (`image_id,body_region,laterality,injury_type`), a wide CSV (`LUE,RUE,LLE,RLE` …), or a `{image: {site: class}}` dict. Things to try for higher CV accuracy:
 * `--backbone eva02_base_patch14_448.mim_in22k_ft_in22k_in1k --size 448`
 * `--backbone convnext_base.fb_in22k_ft_in1k_384`

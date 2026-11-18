@@ -190,6 +190,162 @@ def sample_classes(rng):
             return cls
 
 
+# --------------------------------------------------------------------------- crude "paint" priors
+# A diffusion inpaint on its own redraws whatever the surroundings suggest (an intact limb), so
+# each edit is first painted crudely into the pixels, then made photorealistic at partial
+# strength. At strength < 1 the model keeps the painted layout (no hand where we erased it,
+# a red stump where we drew one) and only fixes texture and lighting.
+
+def _np(img):
+    return np.array(img).astype(np.float32)
+
+
+def _img(a):
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+
+
+def _blend(img, layer_rgb, alpha):
+    a = _np(img)
+    al = (np.asarray(alpha).astype(np.float32) / 255.0)[..., None]
+    return _img(a * (1 - al) + layer_rgb * al)
+
+
+def _blob(center, r, rng, n=14, jitter=0.35):
+    pts = []
+    for k in range(n):
+        ang = 2 * math.pi * k / n + rng.uniform(-0.15, 0.15)
+        rr = r * rng.uniform(1 - jitter, 1 + jitter * 0.4)
+        pts.append((float(center[0] + rr * math.cos(ang)), float(center[1] + rr * math.sin(ang))))
+    return pts
+
+
+def _noise(rng, scale=18.0):
+    g = np.random.default_rng(rng.randrange(1 << 30))
+    small = g.normal(0, 1, (H // 8, W // 8)).astype(np.float32)
+    big = np.array(Image.fromarray((small * 40 + 128).clip(0, 255).astype(np.uint8)).resize((W, H), Image.BICUBIC))
+    smooth = (big.astype(np.float32) - 128) / 40 * scale
+    return smooth[..., None] + g.normal(0, scale * 0.4, (H, W, 1)).astype(np.float32)
+
+
+def _solid(rgb):
+    return np.broadcast_to(np.array(rgb, np.float32), (H, W, 3))
+
+
+def paint_wound(img, c, r, kind, rng):
+    m = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(m).polygon(_blob(c, r, rng), fill=255)
+    m = m.filter(ImageFilter.GaussianBlur(3))
+    base = (70, 38, 28) if "burn" in kind else (120, 12, 16)
+    img = _blend(img, _solid(base) + _noise(rng, 22), m)
+    core = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(core).polygon(_blob(c, r * 0.45, rng), fill=200)
+    img = _blend(img, _solid((55, 0, 6)) + _noise(rng, 10), core.filter(ImageFilter.GaussianBlur(2)))
+    d = ImageDraw.Draw(img)
+    if "fracture" in kind:
+        a = rng.uniform(0, math.pi)
+        d.line([(c[0] - r * 0.5 * math.cos(a), c[1] - r * 0.5 * math.sin(a)),
+                (c[0] + r * 0.6 * math.cos(a), c[1] + r * 0.6 * math.sin(a))],
+               fill=(228, 220, 200), width=max(4, int(r * 0.22)))
+    if "shrapnel" in kind:
+        for _ in range(rng.randint(4, 8)):
+            p = (c[0] + rng.uniform(-r, r), c[1] + rng.uniform(-r, r))
+            q = rng.uniform(r * 0.08, r * 0.18)
+            d.ellipse([p[0] - q, p[1] - q, p[0] + q, p[1] + q], fill=(60, 0, 5))
+    return img, m
+
+
+def body_hull_mask(kps, pad) -> np.ndarray:
+    """Boolean mask of the casualty's body (convex hull of all keypoints, padded)."""
+    import cv2
+
+    pts = kps[kps[:, 2] > 0.3, :2].astype(np.int32)
+    m = np.zeros((H, W), np.uint8)
+    if len(pts) >= 3:
+        cv2.fillConvexPoly(m, cv2.convexHull(pts), 255)
+    k = max(3, int(pad) | 1)
+    return cv2.dilate(m, np.ones((k, k), np.uint8)) > 0
+
+
+def remove_region(img, mask_l, kps, pad, rng):
+    """
+    Wipe a limb out by pasting ground copied from elsewhere in the same photo (shifted so the
+    source patch lies off the body). Falls back to classical Telea inpainting if no clean patch
+    fits. Either way the limb pixels are gone before diffusion sees them.
+    """
+    import cv2
+
+    a = np.array(img)
+    hard = np.array(mask_l) > 40
+    ys, xs = np.nonzero(hard)
+    if len(xs) == 0:
+        return img
+    body = body_hull_mask(kps, pad)
+    shifts = [(dx, dy) for dx in range(-700, 701, 50) for dy in range(-600, 601, 50) if abs(dx) + abs(dy) >= 150]
+    rng.shuffle(shifts)
+    al = (np.array(mask_l.filter(ImageFilter.GaussianBlur(4))).astype(np.float32) / 255)[..., None]
+    for dx, dy in shifts:  # one clean shift for the whole region (most coherent)
+        sx, sy = xs + dx, ys + dy
+        if sx.min() < 0 or sy.min() < 0 or sx.max() >= W or sy.max() >= H or body[sy, sx].any():
+            continue
+        out = a.copy()
+        out[ys, xs] = a[sy, sx]
+        return _img(a * (1 - al) + out * al)
+    # region too big for one shift: fill tile by tile, reusing the last good shift when possible
+    out, left = a.copy(), hard.copy()
+    T, last = 48, None
+    for ty in range(0, H, T):
+        for tx in range(0, W, T):
+            tm = hard[ty:ty + T, tx:tx + T]
+            if not tm.any():
+                continue
+            yy, xx = np.nonzero(tm)
+            yy, xx = yy + ty, xx + tx
+            for dx, dy in ([last] if last else []) + shifts:
+                sx, sy = xx + dx, yy + dy
+                if sx.min() < 0 or sy.min() < 0 or sx.max() >= W or sy.max() >= H or body[sy, sx].any():
+                    continue
+                out[yy, xx] = a[sy, sx]
+                left[yy, xx] = False
+                last = (dx, dy)
+                break
+    if left.any():  # whatever no clean tile could cover
+        bgr = np.ascontiguousarray(out[:, :, ::-1])
+        out = cv2.inpaint(bgr, left.astype(np.uint8) * 255, 9, cv2.INPAINT_TELEA)[:, :, ::-1]
+    return _img(a * (1 - al) + out.astype(np.float32) * al)
+
+
+def paint_stump(img, cut, direction, width, rng):
+    u = direction / (np.linalg.norm(direction) + 1e-6)
+    ang = math.degrees(math.atan2(u[1], u[0]))
+    pool = Image.new("L", (W, H), 0)
+    pc = cut + u * width * 0.7
+    ImageDraw.Draw(pool).polygon(_blob(pc, width * rng.uniform(0.8, 1.2), rng, jitter=0.5), fill=230)
+    pool = pool.filter(ImageFilter.GaussianBlur(4))
+    img = _blend(img, _solid((95, 5, 10)) + _noise(rng, 14), pool)
+    sz = int(width * 2)
+    face = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+    fd = ImageDraw.Draw(face)
+    cx = cy = width
+    fd.ellipse([cx - width * 0.28, cy - width * 0.52, cx + width * 0.28, cy + width * 0.52], fill=(150, 20, 28, 255))
+    fd.ellipse([cx - width * 0.10, cy - width * 0.14, cx + width * 0.10, cy + width * 0.14], fill=(232, 222, 205, 255))
+    face = face.rotate(-ang, resample=Image.BICUBIC, expand=False)
+    out = img.copy()
+    out.paste(face, (int(cut[0] - cx), int(cut[1] - cy)), face)
+    m = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(m).ellipse([cut[0] - width * 0.9, cut[1] - width * 0.9, cut[0] + width * 0.9, cut[1] + width * 0.9], fill=255)
+    m = Image.composite(Image.new("L", (W, H), 255), m, pool)  # stump region + blood pool
+    return out, m.filter(ImageFilter.GaussianBlur(6))
+
+
+def paint_cover(img, mask_l, rgb, rng):
+    return _blend(img, _solid(rgb) + _noise(rng, 26), mask_l)
+
+
+BLANKET_RGB = {"olive drab wool blanket": (92, 96, 60), "grey wool blanket": (120, 120, 118),
+               "silver emergency foil blanket": (190, 190, 196), "dark green poncho": (48, 66, 46),
+               "brown tarp": (110, 84, 56)}
+
+
 def apply_limb(inp, img, kps, site, cls, scene, rng, seed, log):
     prox, mid, dist = (pt(kps, n) for n in LIMBS[site])
     upper = site.startswith("upper")
@@ -202,35 +358,39 @@ def apply_limb(inp, img, kps, site, cls, scene, rng, seed, log):
         seg = rng.choice([(prox, mid), (mid, dist)])
         c = seg[0] + (seg[1] - seg[0]) * rng.uniform(0.35, 0.65)
         kind = rng.choice(WOUNDS["upper" if upper else "lower"])
-        prompt = (f"close-up of a medical training manikin {part} with {kind}, realistic moulage special-effects makeup, "
-                  f"glossy fake blood, torn clothing around the wound, photo")
-        img = inpaint(inp, img, disc_mask(c, width * 0.85), prompt, seed, strength=0.9)
+        r = width * rng.uniform(0.8, 1.15)
+        img, m = paint_wound(img, c, r, kind, rng)
+        mask = m.filter(ImageFilter.MaxFilter(9)).filter(ImageFilter.GaussianBlur(5))
+        prompt = f"{kind}, realistic moulage trauma makeup on a training manikin {part}, glossy fake blood, torn fabric, photo"
+        img = inpaint(inp, img, mask, prompt, seed, strength=0.6)
         log[site] = dict(cls=cls, kind=kind, center=c.round(1).tolist())
 
     elif cls == "amputation":
-        # cut between the middle joint and the distal joint (below elbow/knee) or above it
-        if rng.random() < 0.65:
-            cut = mid + (dist - mid) * rng.uniform(0.25, 0.55)
-            removed = [cut, dist]
+        if rng.random() < 0.65:  # below elbow / knee
+            cut = mid + (dist - mid) * rng.uniform(0.25, 0.5)
+            removed, direction = [cut, dist], dist - mid
             level = "below the elbow" if upper else "below the knee"
         else:
-            cut = prox + (mid - prox) * rng.uniform(0.45, 0.7)
-            removed = [cut, mid, dist]
+            cut = prox + (mid - prox) * rng.uniform(0.5, 0.7)
+            removed, direction = [cut, mid, dist], mid - prox
             level = "above the elbow" if upper else "above the knee"
-        extend = s * (0.35 if upper else 0.45)  # hand / foot beyond the distal keypoint
-        erase = capsule_mask(removed, width * 1.6, extend_end=extend, blur=8)
-        img = inpaint(inp, img, erase, f"empty {ground}, bare ground with nothing on it, photo", seed, strength=1.0)
-        stump = disc_mask(cut, width * 0.95)
-        prompt = (f"severed manikin {part} amputated {level}, ending in a ragged bloody amputation stump with exposed bone and torn "
-                  f"flesh, realistic moulage, fake blood pooling on the {ground}, tourniquet above the stump, photo")
-        img = inpaint(inp, img, stump, prompt, seed + 1, strength=0.92)
+        extend = s * (0.5 if upper else 0.65)  # hand / boot beyond the distal keypoint
+        u = direction / (np.linalg.norm(direction) + 1e-6)
+        start = cut + u * width * 0.25  # keep the stump itself
+        erase = capsule_mask([start] + removed[1:], width * 2.4, extend_end=extend, blur=4)
+        img = remove_region(img, erase, kps, width * 2, rng)
+        img = inpaint(inp, img, erase, f"{ground}, empty ground, nothing there, photo", seed, strength=0.45)
+        img, m = paint_stump(img, cut, direction, width, rng)
+        prompt = f"bloody amputation stump {level}, exposed bone, torn flesh, moulage on training manikin, blood pool on {ground}, photo"
+        img = inpaint(inp, img, m, prompt, seed + 1, strength=0.55)
         log[site] = dict(cls=cls, level=level, cut=cut.round(1).tolist())
 
     elif cls == "not_testable":
-        extend = s * (0.35 if upper else 0.45)
-        cover = capsule_mask([prox, mid, dist], width * 2.2, extend_end=extend, blur=10)
+        extend = s * (0.4 if upper else 0.5)
+        cover = capsule_mask([prox, mid, dist], width * 2.3, extend_end=extend, blur=8)
         blanket = rng.choice(BLANKETS)
-        img = inpaint(inp, img, cover, f"a crumpled {blanket} lying on the {ground}, completely covering, photo", seed, strength=1.0)
+        img = paint_cover(img, cover, BLANKET_RGB[blanket], rng)
+        img = inpaint(inp, img, cover, f"crumpled {blanket} with folds lying on {ground}, photo", seed, strength=0.7)
         log[site] = dict(cls=cls, blanket=blanket)
     else:
         log[site] = dict(cls=cls)

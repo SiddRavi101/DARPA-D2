@@ -5,11 +5,11 @@ Text-to-image alone gets the injuries wrong (amputations come out as wounds, sid
 swapped). So each image is built in steps and the label comes from the edit we applied,
 not from the prompt:
 
-  1. FLUX.1-schnell draws an UNINJURED full-body manikin in a random scene/viewpoint.
+  1. A photoreal text-to-image model (RealVisXL by default, or FLUX.1-schnell) draws an UNINJURED full-body manikin in a random scene/viewpoint.
   2. A pose model (YOLO11-pose, COCO keypoints) finds shoulders/elbows/wrists/hips/
      knees/ankles. COCO left/right are the PERSON's left/right = the ICD's anatomical side.
      Bases where any limb keypoint is missing or low-confidence are thrown away.
-  3. Each limb gets a class and a masked FLUX inpaint:
+  3. Each limb gets a class and a masked inpaint:
        wound        -> small mask on one limb segment, "moulage laceration/burn/..." prompt
        amputation   -> (a) erase the distal limb with a background-only prompt,
                        (b) paint a stump at the cut point
@@ -42,7 +42,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from d2qual.schema import SITE_KEYS, build_document, make_prediction  # noqa: E402
 
 W, H = 1024, 768
-MODEL = "black-forest-labs/FLUX.1-schnell"  # Apache-2.0, not gated
+# Backends. "sdxl" (default) needs no Hugging Face token: RealVisXL is ungated, openrail++.
+# "flux" needs a token with the FLUX.1-schnell terms accepted (the repo is gated).
+FLUX_MODEL = "black-forest-labs/FLUX.1-schnell"
+SDXL_T2I = "SG161222/RealVisXL_V5.0"
+SDXL_INPAINT = "OzzyGT/RealVisXL_V4.0_inpainting"
+NEG = ("cartoon, drawing, illustration, 3d render, cgi, deformed, extra limbs, missing limbs, fused fingers, "
+       "text, watermark, blurry")
+BACKEND = "sdxl"
 
 # COCO keypoint indices (person's own left/right)
 KP = dict(l_sh=5, r_sh=6, l_el=7, r_el=8, l_wr=9, r_wr=10, l_hip=11, r_hip=12, l_kn=13, r_kn=14, l_an=15, r_an=16)
@@ -77,11 +84,30 @@ CLASS_W = {"no_injury": 0.35, "wound": 0.3, "amputation": 0.22, "not_testable": 
 
 
 def load_pipes(device):
-    from diffusers import FluxInpaintPipeline, FluxPipeline
+    if BACKEND == "flux":
+        from diffusers import FluxInpaintPipeline, FluxPipeline
 
-    t2i = FluxPipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16).to(device)
-    inp = FluxInpaintPipeline(**t2i.components)  # shares the same weights, no extra VRAM
-    return t2i, inp
+        t2i = FluxPipeline.from_pretrained(FLUX_MODEL, torch_dtype=torch.bfloat16).to(device)
+        inp = FluxInpaintPipeline(**t2i.components)  # shares the same weights, no extra VRAM
+        return t2i, inp
+    from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLPipeline
+
+    def load(cls, repo):
+        try:
+            return cls.from_pretrained(repo, torch_dtype=torch.float16, variant="fp16").to(device)
+        except (OSError, ValueError):  # repo has no fp16 variant files
+            return cls.from_pretrained(repo, torch_dtype=torch.float16).to(device)
+
+    return load(StableDiffusionXLPipeline, SDXL_T2I), load(StableDiffusionXLInpaintPipeline, SDXL_INPAINT)
+
+
+def text2img(pipe, prompt, seed):
+    g = torch.Generator("cuda").manual_seed(seed)
+    if BACKEND == "flux":
+        return pipe(prompt=prompt, height=H, width=W, num_inference_steps=4, guidance_scale=0.0,
+                    max_sequence_length=256, generator=g).images[0]
+    return pipe(prompt=prompt, negative_prompt=NEG, height=H, width=W, num_inference_steps=30,
+                guidance_scale=5.5, generator=g).images[0]
 
 
 def detect(pose_model, img: Image.Image):
@@ -127,23 +153,26 @@ def disc_mask(center, r, blur=5) -> Image.Image:
     return m.filter(ImageFilter.GaussianBlur(blur))
 
 
-def inpaint(pipe, img, mask, prompt, seed, strength=0.95, steps=8):
+def inpaint(pipe, img, mask, prompt, seed, strength=0.95):
     g = torch.Generator("cuda").manual_seed(seed)
-    out = pipe(prompt=prompt, image=img, mask_image=mask, height=H, width=W, strength=strength,
-               num_inference_steps=steps, guidance_scale=0.0, max_sequence_length=256, generator=g).images[0]
-    return out
+    if BACKEND == "flux":
+        return pipe(prompt=prompt, image=img, mask_image=mask, height=H, width=W, strength=strength,
+                    num_inference_steps=8, guidance_scale=0.0, max_sequence_length=256, generator=g).images[0]
+    out = pipe(prompt=prompt, negative_prompt=NEG, image=img, mask_image=mask, height=H, width=W,
+               strength=min(strength, 0.99), num_inference_steps=30, guidance_scale=7.0, generator=g).images[0]
+    # keep pixels outside the mask exactly as they were (SDXL's VAE round-trip shifts them slightly)
+    return Image.composite(out, img, mask)
 
 
 def make_base(t2i, pose_model, rng, seed, max_tries=6):
     for t in range(max_tries):
         scene = dict(ground=rng.choice(GROUNDS), clothes=rng.choice(CLOTHES), view=rng.choice(VIEWS),
                      light=rng.choice(LIGHTS), pose=rng.choice(POSES))
-        prompt = (f"Realistic documentary photo of an adult full-body medical CPR trauma training manikin {scene['pose']} on "
-                  f"{scene['ground']}, wearing {scene['clothes']}. The whole body from head to feet is in frame, both arms "
-                  f"and both legs fully visible, intact and uninjured. {scene['view']}, {scene['light']}, DSLR photo, sharp focus.")
-        g = torch.Generator("cuda").manual_seed(seed * 100 + t)
-        img = t2i(prompt=prompt, height=H, width=W, num_inference_steps=4, guidance_scale=0.0,
-                  max_sequence_length=256, generator=g).images[0]
+        # SDXL's text encoder reads ~77 tokens, so the important words come first
+        prompt = (f"RAW photo, full body medical trauma training manikin {scene['pose']} on {scene['ground']}, "
+                  f"wearing {scene['clothes']}, entire body from head to feet in frame, both arms and both legs visible, "
+                  f"{scene['view']}, {scene['light']}, DSLR")
+        img = text2img(t2i, prompt, seed * 100 + t)
         kps = detect(pose_model, img)
         if kps is None:
             continue
@@ -226,8 +255,11 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--prefix", default="flux_")
+    ap.add_argument("--prefix", default="syn_")
+    ap.add_argument("--backend", choices=["sdxl", "flux"], default="sdxl")
     args = ap.parse_args(argv)
+    global BACKEND
+    BACKEND = args.backend
 
     from ultralytics import YOLO
 

@@ -218,11 +218,15 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
             sched.step()
             running += loss.item()
         msg = f"epoch {epoch + 1}/{args.epochs} loss {running / max(1, len(tl)):.4f} ({time.time() - t0:.0f}s)"
-        if vl is not None:
+        last = epoch + 1 == args.epochs
+        if vl is not None and (last or args.select == "best" or args.val_curve):
             m = evaluate(model, vl, device, return_probs=True)
             probs = m.pop("probs")
             msg += f" val_acc {m['overall_accuracy']:.4f}"
-            if m["overall_accuracy"] > best["overall_accuracy"]:
+            # "last" (default): the reported/OOF score is the fixed final epoch, so CV numbers are honest.
+            # "best" picks the epoch on the same fold it is scored on, which inflates CV accuracy.
+            keep = last if args.select == "last" else m["overall_accuracy"] > best["overall_accuracy"]
+            if keep:
                 best = {**m, "oof": {iid: pr.tolist() for iid, pr in zip(val_ids, probs)}}
                 save_checkpoint(out_path, model, fallback, {**m, "epoch": epoch + 1})
                 msg += " *"
@@ -249,6 +253,9 @@ def main(argv=None) -> None:
     ap.add_argument("--label-smoothing", type=float, default=0.05)
     ap.add_argument("--folds", type=int, default=5, help="k for k-fold; 1 = train on all data, no val")
     ap.add_argument("--only-fold", type=int, default=None)
+    ap.add_argument("--select", choices=["last", "best"], default="last",
+                    help="checkpoint/score per fold: fixed final epoch (honest CV, default) or best val epoch (optimistic)")
+    ap.add_argument("--val-curve", action="store_true", help="also evaluate every epoch (logging only)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-pretrained", action="store_true", help="debug only")

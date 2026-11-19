@@ -337,3 +337,45 @@ def test_vlm_members_skipped_on_cpu_but_output_valid(image_dir, tmp_path):
     run(image_dir, out, wdir, "t", "1", "e@x", batch_size=3)  # CPU in tests: VLM skipped, prior used
     doc = json.loads(out.read_text(encoding="utf-8"))
     assert schema.validate_document(doc, [p.name for p in schema.list_images(image_dir)]) == []
+
+
+def test_fixed_final_epoch_is_kept_by_default(image_dir, tmp_path):
+    pytest.importorskip("timm")
+    import torch
+
+    from d2qual import train
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps(_doc(LABELS)))
+    wdir = tmp_path / "w"
+    train.main(["--images", str(image_dir), "--labels", str(labels_path), "--out", str(wdir),
+                "--backbone", "resnet18", "--size", "64", "--epochs", "3", "--batch", "2",
+                "--folds", "2", "--workers", "0", "--no-pretrained"])
+    for p in wdir.glob("fold*.pt"):
+        ck = torch.load(p, map_location="cpu", weights_only=False)
+        assert ck["metrics"]["epoch"] == 3, ck["metrics"]
+    assert json.loads((wdir / "oof_probs.json").read_text())
+
+
+def test_day_one_inspect_and_run_requires_grouping(tmp_path):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import day_one
+
+    d = tmp_path / "imgs"
+    d.mkdir()
+    labels = {}
+    for s in range(3):
+        for k in range(4):
+            name = f"scene{s}_{k:03d}.jpg"
+            Image.new("RGB", (120, 90), (s * 60, k * 40, 90)).save(d / name)
+            labels[name] = ["no_injury", "wound", "amputation", "not_testable"]
+    lp = tmp_path / "labels.json"
+    lp.write_text(json.dumps(_doc(labels)))
+    work = tmp_path / "work"
+    day_one.main(["inspect", "--images", str(d), "--labels", str(lp), "--work", str(work)])
+    rep = json.loads((work / "inspect.json").read_text())
+    assert rep["n"] == 12
+    assert any(g["n_groups"] == 3 for g in rep["groupings"])
+    assert "Majority-class accuracy" in (work / "inspect.md").read_text()
+    with pytest.raises(SystemExit):
+        day_one.main(["run", "--images", str(d), "--labels", str(lp), "--work", str(work)])

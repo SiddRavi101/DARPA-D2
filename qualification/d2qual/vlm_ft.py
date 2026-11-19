@@ -257,10 +257,12 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback)
             running += loss.item()
             n += 1
         msg = f"epoch {epoch + 1}/{args.epochs} loss {running / max(1, n):.4f} ({time.time() - t0:.0f}s)"
-        if val_ids:
+        select = getattr(args, "select", "last")
+        last = epoch + 1 == args.epochs
+        if val_ids and (last or select == "best" or getattr(args, "val_curve", False)):
             acc, probs, conf = evaluate()
             msg += f" val_acc {acc:.4f}"
-            if acc > best["overall_accuracy"]:
+            if (last if select == "last" else acc > best["overall_accuracy"]):
                 best = {"overall_accuracy": acc, "epoch": epoch + 1,
                         "confusion": {"labels": list(CLASSES), "matrix": conf.tolist()},
                         "oof": {iid: pr.tolist() for iid, pr in zip(val_ids, probs)}}

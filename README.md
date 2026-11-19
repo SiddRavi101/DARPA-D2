@@ -30,6 +30,19 @@ Refactor of [SecondLife](https://github.com/rmagesh-quml/SecondLife_GoogleHackat
 The pipeline ran end to end on 3,000 procedurally generated simulated-casualty images and was scored on 600 held-out ones. It reached **96.5% overall accuracy** (macro-F1 0.964, 5-fold CV 96.9% ± 0.8%). The prior-only fallback scores 45.9% on the same images. These are synthetic images, so this number does not predict the score on DARPA's photos. See [results/synthetic_poc_2026-11-17.md](qualification/results/synthetic_poc_2026-11-17.md) for the full breakdown. To reproduce on any GPU box, run `bash qualification/scripts/run_synthetic_poc.sh`.
 
 ### Train (on the DARPA training set, GPU machine)
+Day one: run `scripts/day_one.py`. It works in two steps with a human check in between.
+
+1. **`inspect`:** prints class counts per site, the majority-class floor, image sizes and candidate scene/manikin groupings.
+2. **`run`:** runs the grouped bake-off, leaderboard, ensemble and a timing projection against the 1 h limit. It stops before submitting.
+
+```bash
+python scripts/day_one.py inspect --images /data/d2/train/images --labels /data/d2/train/labels.json
+python scripts/day_one.py run --images /data/d2/train/images --labels /data/d2/train/labels.json --group-regex '<from inspect>'
+```
+
+Each fold keeps its **final epoch** (`--select last`, the default), so CV and OOF scores are honest. `--select best` picks the best epoch on the same fold it is scored on, which inflates the score.
+
+Manual training:
 ```bash
 cd qualification
 pip install torch torchvision -r requirements-train.txt

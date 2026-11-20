@@ -17,7 +17,7 @@ Refactor of [SecondLife](https://github.com/rmagesh-quml/SecondLife_GoogleHackat
 * **Joint 4-site classifier:** one pretrained timm backbone (default ConvNeXt-S, 512 px) with a 4×4-logit head. All four limbs share visual context, for example a casualty lying on one side hides a limb.
 * **Mirror augmentation that swaps sides:** flipping an image left-right swaps the casualty's anatomical left and right. Most teams either skip flipping or corrupt their labels with it. Here the left/right labels are swapped with the image, which doubles the effective data. The same trick gives free test-time augmentation by averaging the original and mirrored predictions.
 * **No random crops:** cropping a limb out of frame changes its true label to `not_testable`. Images are letterboxed instead.
-* **5-fold stratified CV and an ensemble:** each fold is checkpointed, and inference averages all `model/weights/*.pt` files. The metric reported is exactly the ICD's overall accuracy.
+* **Grouped 5-fold CV, a bake-off and a weighted ensemble:** photos of one scene or manikin stay in one fold, and each fold keeps its final epoch, so scores are honest. Candidates (EVA02-B, SigLIP-B, ConvNeXt-S, Qwen2-VL-2B) are ranked on out-of-fold accuracy, and greedy selection picks the weighted ensemble (`ensemble.json`). The metric is exactly the ICD's overall accuracy. Full plan: [qualification/PLAN.md](qualification/PLAN.md).
 * **Cannot emit an invalid file:**
   * A valid fallback `predictions.json` is written before inference starts.
   * Every image gets exactly four sites, and broken images become `not_testable`.

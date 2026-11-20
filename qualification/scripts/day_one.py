@@ -11,7 +11,7 @@ Day one with the DARPA training set: two commands, and a human checkpoint in bet
                timed offline inference projected to the test-set size. It STOPS there and prints
                the submit command; it never pushes anything.
        python scripts/day_one.py run --images DATA/images --labels DATA/labels.json \\
-           --group-regex '^(scene\\d+)_' [--candidates eva02_b,siglip_b,convnext_s] [--test-size N, default 20% of train]
+           --group-regex '^(scene\\d+)_' [--candidates eva02_b,siglip_b,convnext_s,vlm_qwen2vl_2b] [--test-size N, default 20% of train]
 
 TODO once the data is seen: if the label format is not one d2qual.data.load_labels already
 reads (ICD predictions JSON, JSONL, CSV), add a reader there - inspect will fail loudly first.
@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT))
 from d2qual.data import load_labels, match_images  # noqa: E402
 from d2qual.schema import CLASSES, SITE_KEYS  # noqa: E402
 
-DEFAULT_CANDIDATES = "eva02_b,siglip_b,convnext_s"  # COCO-filter survivors; add vlm_qwen2vl_2b if budget allows
+DEFAULT_CANDIDATES = "eva02_b,siglip_b,convnext_s,vlm_qwen2vl_2b"  # COCO-filter survivors (PLAN.md)
 BUDGET_S = 50 * 60  # predict.py's own wall-clock budget inside DARPA's 1 h
 
 # Candidate grouping patterns, most specific first. Each must leave >= 2 images per group on average.

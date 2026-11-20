@@ -11,7 +11,7 @@ Day one with the DARPA training set: two commands, and a human checkpoint in bet
                timed offline inference projected to the test-set size. It STOPS there and prints
                the submit command; it never pushes anything.
        python scripts/day_one.py run --images DATA/images --labels DATA/labels.json \\
-           --group-regex '^(scene\\d+)_' [--candidates eva02_b,siglip_b,convnext_s] [--test-size 2000]
+           --group-regex '^(scene\\d+)_' [--candidates eva02_b,siglip_b,convnext_s] [--test-size N, default 20% of train]
 
 TODO once the data is seen: if the label format is not one d2qual.data.load_labels already
 reads (ICD predictions JSON, JSONL, CSV), add a reader there - inspect will fail loudly first.
@@ -142,6 +142,8 @@ def cmd_run(a) -> None:
     _sh([py, "scripts/bakeoff.py", "assemble", "--runs", str(runs), "--out", str(weights)])
 
     # Timing: run the assembled ensemble offline on a sample, project to the test-set size.
+    if a.test_size is None:  # ICD: test set ~20% the size of the training set
+        a.test_size = max(1, round(0.2 * len(match_images(a.images, load_labels(a.labels)))))
     sample = sorted(p for p in Path(a.images).iterdir() if p.is_file())[: a.time_sample]
     tin = work / "timing_in"
     tin.mkdir(exist_ok=True)
@@ -187,7 +189,8 @@ def main(argv=None) -> None:
     r.add_argument("--candidates", default=DEFAULT_CANDIDATES)
     r.add_argument("--folds", type=int, default=5)
     r.add_argument("--epochs", type=int, default=15)
-    r.add_argument("--test-size", type=int, default=2000, help="expected number of test images (guess until known)")
+    r.add_argument("--test-size", type=int, default=None,
+                   help="expected number of test images (default: 20%% of the training set, per ICD v1.0 3.1)")
     r.add_argument("--time-sample", type=int, default=200)
     a = ap.parse_args(argv)
     (cmd_inspect if a.cmd == "inspect" else cmd_run)(a)

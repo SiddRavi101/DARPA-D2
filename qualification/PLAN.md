@@ -50,9 +50,30 @@ For each manikin photo we label four limb sites as `no_injury`, `wound`, `amputa
    - Produces contact sheets of the most confident mistakes, per-class recall and a left/right swap count.
    - Fix systematic errors, then run round 2 on the top candidates only.
 6. **Timing check** (inside `day_one.py run`). The assembled ensemble runs offline on 200 images, and the result is projected to 20% of the training set against the 50-minute budget (OK / TIGHT / TOO SLOW).
-7. **Submit** (a person runs it).
+7. **Blind test** on the Mannequin In-Bed set: one run of the locked ensemble, scored once (see the next section).
+8. **Submit** (a person runs it).
    - `scripts/submit.sh` builds the image, runs a CPU smoke test and the validator, scans with ClamAV, pushes, and records the digest.
    - Then send the submission details to DARPA.
+
+## Blind test: Mannequin In-Bed
+
+This is an outside check that the locked ensemble works on a **manikin** it has never seen: lying down, in different lighting, from a different camera. It exists to catch failures that DARPA-only cross-validation can't, such as left/right swaps on a lying body or a model that only works on DARPA's camera setup.
+
+- **Data:** Northeastern ACLab "Mannequin In-Bed" set (about 419 images, RGB webcam + infrared, 2D joint labels). Page: <https://ostadabbas.sites.northeastern.edu/?p=5153>; zips:
+  - <http://www.coe.neu.edu/Research/AClab/pose/IRS_MANNE_rawN.zip>
+  - <http://www.coe.neu.edu/Research/AClab/pose/colorManneNumbered.zip>
+- **Labels:** derived from the joint labels the same way as the COCO proxy. A limb is `no_injury` when at least 2 of its joints are visible in the frame, and `not_testable` otherwise. Tight crops and 0/90/180/270° rotations add hidden-limb and orientation cases. There are no wounds or amputations, so it tests **limb finding, side and visibility** only.
+- **Blind rules:**
+  - Never used for training, model selection, ensemble weights or threshold tuning.
+  - Run **once**, on the locked ensemble, after the leaderboard is final (Nov 25).
+  - Report overall accuracy, accuracy per site, and the **left/right swap rate**.
+  - If it exposes a problem (e.g. a high swap rate), fix the cause on DARPA data, never by tuning to this set.
+- **Pass bar:** no hard bar. Treat it as a warning light: a large gap from the DARPA cross-validation score, or a swap rate well above the COCO screen's, means the ensemble is leaning on DARPA-specific cues.
+- **Before use:**
+  - confirm the links still work and the license; no terms are posted for the mannequin data, so email the ACLab;
+  - include it in the DARPA data question below;
+  - store it under `data/external/` (git-ignored).
+- **To build:** `scripts/build_mannequin_test.py`, which converts the joint labels into ICD `labels.json`, like `build_coco_proxy.py`. Written once we see the label format.
 
 ## Candidates
 
@@ -97,7 +118,7 @@ Training runs on Runpod Secure Cloud A40s (48 GB, $0.59/hr). That's the card our
 1. **Nov 21:** get server access, run `inspect`, pick the grouping, and email DARPA the cloud-GPU question.
 2. **Nov 22:** bake-off round 1 (image models and VLM in parallel). GitLab dry-run push with a placeholder image.
 3. **Nov 23–24:** error review, targeted fixes, round 2 on the top candidates.
-4. **Nov 25:** lock the ensemble and run the timing check.
+4. **Nov 25:** lock the ensemble, run the timing check, then the one-time Mannequin In-Bed blind test.
 5. **Nov 27–28:** final build, smoke test, ClamAV, push, digest, submit the details.
 6. **Nov 29–30:** buffer. **Deadline Dec 1.**
 
@@ -114,6 +135,7 @@ Training runs on Runpod Secure Cloud A40s (48 GB, $0.59/hr). That's the card our
 ## Open questions for DARPA (D2Sprint@darpa.mil)
 
 - [ ] May we process the dataset on a rented cloud GPU instance we control?
+- [ ] May we use public datasets (COCO, the Mannequin In-Bed manikin set) to select and sanity-check models? Rules §6 bars "any other human subject data".
 - [ ] Do submission details go by email (ICD v1.1) or through a Submission Portal (v1.0)?
 - [ ] Is `not_testable` valid in the v1.1 schema appendix? The v1.0 appendix omits it.
 

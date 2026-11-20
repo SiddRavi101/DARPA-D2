@@ -72,8 +72,14 @@ This is an outside check that the locked ensemble works on a **manikin** it has 
 - **Before use:**
   - confirm the links still work and the license; no terms are posted for the mannequin data, so email the ACLab;
   - include it in the DARPA data question below;
-  - store it under `data/external/` (git-ignored).
-- **To build:** `scripts/build_mannequin_test.py`, which converts the joint labels into ICD `labels.json`, like `build_coco_proxy.py`. Written once we see the label format.
+- **Built** (2026-11-20) with `scripts/build_mannequin_test.py` from the IRS zip: **838 images** from 419 photos (one loose crop plus one tight or half-body crop each, random 0/90/180/270° rotation). Each site is 73–82% `no_injury` and 18–27% `not_testable`. Stored in `qualification/data/mannequin_test/` (git-ignored). The joint labels were checked visually: they use the manikin's own sides.
+- **Run (once, Nov 25):**
+
+  ```
+  python inference.py --input data/mannequin_test --output /tmp/blind.json --weights model/weights
+  python score.py /tmp/blind.json data/mannequin_test/labels.json
+  python -m d2qual.review --images data/mannequin_test --labels data/mannequin_test/labels.json --pred /tmp/blind.json --out review_blind
+  ```
 
 ## Candidates
 

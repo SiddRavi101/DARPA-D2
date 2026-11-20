@@ -398,3 +398,32 @@ def test_new_candidates_registered():
 
     for name in ("siglip2_b", "vlm_qwen3vl_2b", "vlm_qwen3vl_4b"):
         assert name in bakeoff.CANDIDATES
+
+
+def test_mannequin_blind_test_builder(tmp_path):
+    sio = pytest.importorskip("scipy.io")
+    import numpy as np
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import build_mannequin_test as bm
+
+    src = tmp_path / "src"
+    (src / "images").mkdir(parents=True)
+    Image.new("RGB", (300, 400), (90, 90, 140)).save(src / "images" / "000001.jpg")
+    J = np.zeros((3, 16, 1))
+    # face-up body: right side on the viewer's left (small x); legs low, arms high
+    pts = {0: (120, 360), 1: (125, 300), 2: (130, 240), 3: (170, 240), 4: (175, 300), 5: (180, 360),
+           6: (90, 230), 7: (100, 180), 8: (115, 130), 9: (185, 130), 10: (200, 180), 11: (210, 230),
+           12: (150, 120), 13: (150, 70)}
+    for k, (x, y) in pts.items():
+        J[:, k, 0] = (x, y, 0)
+    J[2, 11, 0] = J[2, 10, 0] = 1  # left wrist + elbow occluded -> left arm not testable
+    sio.savemat(str(src / "joints_gt.mat"), {"joints_gt": J})
+    out = tmp_path / "out"
+    bm.main(["--src", str(src), "--out", str(out), "--variants", "1"])
+    doc = json.loads((out / "labels.json").read_text())
+    sites = {(s["body_region"], s["laterality"]): s["injury_type"] for s in doc["predictions"][0]["sites"]}
+    assert sites[("upper_extremity", "left")] == "not_testable"
+    assert sites[("upper_extremity", "right")] == "no_injury"
+    assert sites[("lower_extremity", "left")] == "no_injury"
+    assert bm.limb_label([(10, 10, 0), (20, 20, 0), (30, 30, 1)], (0, 0, 15, 15)) == "not_testable"

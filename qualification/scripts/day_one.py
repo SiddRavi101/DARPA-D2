@@ -135,7 +135,7 @@ def cmd_run(a) -> None:
     common = ["--images", a.images, "--labels", a.labels]
 
     bake = [py, "scripts/bakeoff.py", "run", *common, "--runs", str(runs), "--candidates", a.candidates,
-            "--folds", str(a.folds), "--epochs", str(a.epochs), *grp]
+            "--folds", str(a.folds), "--epochs", str(a.epochs), *grp, "--", "--data-source", "darpa"]
     if _sh(bake) != 0:
         raise SystemExit("bake-off failed; see runs/<candidate>/train.log")
     _sh([py, "scripts/bakeoff.py", "leaderboard", *common, "--runs", str(runs)])

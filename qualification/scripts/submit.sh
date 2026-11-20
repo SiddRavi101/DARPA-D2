@@ -10,7 +10,11 @@ TEAM_SLUG=$(echo "$TEAM" | tr "[:upper:] " "[:lower:]-")
 IMAGE="${TEAM_SLUG}-d2-qualification-task:${TAG}"
 REMOTE="registry.gitlab.com/${PROJECT}/${IMAGE}"
 
-ls model/weights/*.pt >/dev/null 2>&1 || { echo "No trained checkpoints in model/weights — train first"; exit 1; }
+if ! ls model/weights/*.pt >/dev/null 2>&1 && ! ls model/weights/*/vlm_meta.json >/dev/null 2>&1; then
+  echo "No trained checkpoints in model/weights — train first"; exit 1
+fi
+# Ship ONLY models trained on the DARPA training set (no COCO / synthetic / mannequin-test models).
+python scripts/check_provenance.py model/weights || { echo "Refusing to submit: a member is not tagged data_source=darpa"; exit 1; }
 # Limb-crop checkpoints need the pose model baked in (the container has no network).
 if python -c "import glob,sys,torch; sys.exit(0 if any(torch.load(p,map_location='cpu',weights_only=False)['config'].get('limb_crops') for p in glob.glob('model/weights/*.pt')) else 1)"; then
   [ -f model/pose/keypointrcnn.pth ] || python -m d2qual.pose --save-weights model/pose/keypointrcnn.pth

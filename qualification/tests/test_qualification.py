@@ -427,3 +427,29 @@ def test_mannequin_blind_test_builder(tmp_path):
     assert sites[("upper_extremity", "right")] == "no_injury"
     assert sites[("lower_extremity", "left")] == "no_injury"
     assert bm.limb_label([(10, 10, 0), (20, 20, 0), (30, 30, 1)], (0, 0, 15, 15)) == "not_testable"
+
+
+def test_only_darpa_tagged_models_pass_provenance(image_dir, tmp_path):
+    pytest.importorskip("timm")
+    from d2qual import train
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import check_provenance
+
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps(_doc(LABELS)))
+    base = ["--images", str(image_dir), "--labels", str(labels_path), "--backbone", "resnet18", "--size", "64",
+            "--epochs", "1", "--batch", "2", "--folds", "2", "--workers", "0", "--no-pretrained"]
+    untagged, tagged = tmp_path / "untagged", tmp_path / "tagged"
+    train.main([*base, "--out", str(untagged)])
+    train.main([*base, "--out", str(tagged), "--data-source", "darpa"])
+    assert check_provenance.check(untagged)            # e.g. COCO/synthetic runs are refused
+    assert check_provenance.check(tagged) == []
+    # day_one passes "-- --data-source darpa" through bakeoff's REMAINDER args to d2qual.train
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--candidates")
+    ap.add_argument("extra", nargs=argparse.REMAINDER)
+    got = ap.parse_args(["--candidates", "x", "--", "--data-source", "darpa"]).extra
+    assert [t for t in got if t != "--"] == ["--data-source", "darpa"]

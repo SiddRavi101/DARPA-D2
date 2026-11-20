@@ -106,7 +106,8 @@ def flip_logits(logits: torch.Tensor) -> torch.Tensor:
     return logits[:, list(FLIP_PERMUTATION), :]
 
 
-def save_checkpoint(path: str | Path, model: InjuryNet, fallback: list[str], metrics: dict) -> None:
+def save_checkpoint(path: str | Path, model: InjuryNet, fallback: list[str], metrics: dict,
+                    data_source: str | None = None) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -116,6 +117,7 @@ def save_checkpoint(path: str | Path, model: InjuryNet, fallback: list[str], met
             "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
             "fallback": list(fallback),
             "metrics": metrics,
+            "data_source": data_source,  # e.g. "darpa"; scripts/submit.sh ships only "darpa"
             "classes": list(CLASSES),
             "sites": [list(s) for s in SITES],
         },

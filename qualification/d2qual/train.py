@@ -228,13 +228,13 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
             keep = last if args.select == "last" else m["overall_accuracy"] > best["overall_accuracy"]
             if keep:
                 best = {**m, "oof": {iid: pr.tolist() for iid, pr in zip(val_ids, probs)}}
-                save_checkpoint(out_path, model, fallback, {**m, "epoch": epoch + 1})
+                save_checkpoint(out_path, model, fallback, {**m, "epoch": epoch + 1}, args.data_source)
                 msg += " *"
         print(msg, flush=True)
 
     if vl is None:  # full-data run: keep last epoch
         best = {"overall_accuracy": None, "epoch": args.epochs}
-        save_checkpoint(out_path, model, fallback, best)
+        save_checkpoint(out_path, model, fallback, best, args.data_source)
     return best
 
 
@@ -253,6 +253,9 @@ def main(argv=None) -> None:
     ap.add_argument("--label-smoothing", type=float, default=0.05)
     ap.add_argument("--folds", type=int, default=5, help="k for k-fold; 1 = train on all data, no val")
     ap.add_argument("--only-fold", type=int, default=None)
+    ap.add_argument("--data-source", default="unspecified",
+                    help="what the model is trained on, stored in the checkpoint: use 'darpa' ONLY for the DARPA "
+                         "training set; scripts/submit.sh refuses any member not tagged darpa")
     ap.add_argument("--select", choices=["last", "best"], default="last",
                     help="checkpoint/score per fold: fixed final epoch (honest CV, default) or best val epoch (optimistic)")
     ap.add_argument("--val-curve", action="store_true", help="also evaluate every epoch (logging only)")

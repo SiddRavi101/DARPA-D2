@@ -311,7 +311,8 @@ def _save(model, out_dir: Path, base: str, args, fallback, acc):
     model.save_pretrained(out_dir)  # adapter only (~tens of MB)
     (out_dir / META).write_text(json.dumps({
         "format": FORMAT, "base": base, "image_size": args.vlm_size, "classes": list(CLASSES),
-        "fallback": list(fallback), "metrics": {"overall_accuracy": acc}}, indent=1))
+        "fallback": list(fallback), "metrics": {"overall_accuracy": acc},
+        "data_source": getattr(args, "data_source", "unspecified")}, indent=1))
 
 
 # ── inference: all VLM members share one base model ─────────────────────────────

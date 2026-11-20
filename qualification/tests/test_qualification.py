@@ -379,3 +379,22 @@ def test_day_one_inspect_and_run_requires_grouping(tmp_path):
     assert "Majority-class accuracy" in (work / "inspect.md").read_text()
     with pytest.raises(SystemExit):
         day_one.main(["run", "--images", str(d), "--labels", str(lp), "--work", str(work)])
+
+
+def test_vlm_base_dirs_resolve_per_model(tmp_path):
+    from d2qual.vlm_ft import base_dir_name, resolve_base
+
+    assert base_dir_name("Qwen/Qwen3-VL-2B-Instruct") == "Qwen__Qwen3-VL-2B-Instruct"
+    root = tmp_path / "vlm_base"
+    assert resolve_base("Qwen/Qwen3-VL-2B-Instruct", root) == "Qwen/Qwen3-VL-2B-Instruct"  # not baked: hub id
+    (root / "Qwen__Qwen3-VL-2B-Instruct").mkdir(parents=True)
+    (root / "Qwen__Qwen3-VL-2B-Instruct" / "config.json").write_text("{}")
+    assert resolve_base("Qwen/Qwen3-VL-2B-Instruct", root).endswith("Qwen__Qwen3-VL-2B-Instruct")
+
+
+def test_new_candidates_registered():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import bakeoff
+
+    for name in ("siglip2_b", "vlm_qwen3vl_2b", "vlm_qwen3vl_4b"):
+        assert name in bakeoff.CANDIDATES

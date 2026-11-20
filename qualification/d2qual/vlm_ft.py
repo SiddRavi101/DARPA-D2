@@ -2,7 +2,7 @@
 Fine-tuned small vision-language model as an ensemble candidate (the PRONTO-style approach:
 their best limb-injury model was a compact VLM asked short per-limb questions).
 
-Model: Qwen2-VL-2B-Instruct (Apache-2.0, ungated), LoRA-fine-tuned.
+Models: Qwen2-VL-2B-Instruct or Qwen3-VL-2B/4B-Instruct (all Apache-2.0, ungated), LoRA-fine-tuned.
 For every image we ask four questions, one per anatomical limb:
 
     "...Look at the casualty's LEFT ARM (the casualty's own left, not the viewer's left).
@@ -18,7 +18,8 @@ Images are letterboxed to a fixed square so every prompt has the same length (no
 Training (called by d2qual.train when --backbone vlm:<hf-id>):
     python -m d2qual.train ... --backbone vlm:Qwen/Qwen2-VL-2B-Instruct --epochs 3 --batch 4 --lr 1e-4
 Container: the base model must be baked into model/vlm_base/ (scripts/submit.sh does it),
-adapters live in model/weights/<name>/ next to vlm_meta.json.
+adapters live in model/weights/<name>/ next to vlm_meta.json. Each distinct base is baked into
+model/vlm_base/<hub id with / -> __>/ (scripts/submit.sh does it).
 """
 
 from __future__ import annotations
@@ -62,7 +63,12 @@ def _question(site: int) -> str:
 class VLMClassifier:
     def __init__(self, base: str, device, image_size: int = 448, dtype=None, train: bool = False):
         import torch
-        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+        from transformers import AutoProcessor
+
+        try:  # transformers >= 4.57: one class for Qwen2-VL, Qwen2.5-VL and Qwen3-VL
+            from transformers import AutoModelForImageTextToText as ModelCls
+        except ImportError:  # older pins
+            from transformers import Qwen2VLForConditionalGeneration as ModelCls
 
         self.torch = torch
         self.device = device
@@ -71,7 +77,7 @@ class VLMClassifier:
         px = image_size * image_size
         self.processor = AutoProcessor.from_pretrained(base, min_pixels=px, max_pixels=px)
         self.processor.tokenizer.padding_side = "left"
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+        self.model = ModelCls.from_pretrained(
             base, torch_dtype=self.dtype, attn_implementation="sdpa").to(device)
         tok = self.processor.tokenizer
         ids = [tok.encode(L, add_special_tokens=False) for L in LETTERS]
@@ -96,6 +102,14 @@ class VLMClassifier:
         m = self.model
         return m.get_base_model() if hasattr(m, "get_base_model") else m
 
+    def _parts(self):
+        """(causal-LM wrapper, vision tower, text decoder, rope fn) across transformers layouts."""
+        core = self._core()
+        inner = core.model
+        if hasattr(inner, "language_model") and hasattr(inner, "visual"):  # transformers >= 4.52
+            return core, inner.visual, inner.language_model, inner.get_rope_index
+        return core, core.visual, inner, core.get_rope_index  # transformers 4.51 Qwen2-VL
+
     def _text_template(self):
         """Tokenized 4 prompts with the image placeholder already expanded (fixed image size)."""
         if not hasattr(self, "_tmpl"):
@@ -111,32 +125,49 @@ class VLMClassifier:
         from .data import letterbox
 
         torch = self.torch
-        core = self._core()
+        _, visual, _, _ = self._parts()
         sq = [letterbox(im, self.image_size) for im in images]
         pix = self.processor.image_processor(images=sq, return_tensors="pt")
         thw = pix["image_grid_thw"].to(self.device)
-        pv = pix["pixel_values"].to(self.device, core.visual.get_dtype())
+        pv = pix["pixel_values"].to(self.device, next(visual.parameters()).dtype)
         per = int(thw[0].prod())
+        embs, deep = [], []
         with torch.no_grad():  # vision tower is frozen (LoRA only targets the LLM)
-            emb = torch.cat([core.visual(pv[i * per:(i + 1) * per], grid_thw=thw[i:i + 1]) for i in range(len(sq))])
-        return {"n": len(sq), "image_embeds": emb.view(len(sq), -1, emb.shape[-1]), "thw": thw}
+            for i in range(len(sq)):
+                out = visual(pv[i * per:(i + 1) * per], grid_thw=thw[i:i + 1])
+                if isinstance(out, tuple):  # Qwen3-VL: (embeds, deepstack features per injection layer)
+                    out, ds = out
+                    deep.append(ds)
+                embs.append(out)
+        emb = torch.stack(embs)                                    # (N, tokens, d)
+        enc = {"n": len(sq), "image_embeds": emb, "thw": thw}
+        if deep:
+            enc["deepstack"] = [torch.stack([d[k] for d in deep]) for k in range(len(deep[0]))]
+        return enc
 
     def logits_from(self, enc):
         """-> tensor (N, 4 sites, 4 classes) of answer-letter logits."""
         torch = self.torch
-        core = self._core()
+        core, _, lm, rope = self._parts()
         ids, mask, thw1 = self._text_template()
         n = enc["n"]
         input_ids = ids.repeat(n, 1).to(self.device)            # image-major: 4 questions per image
         attn = mask.repeat(n, 1).to(self.device)
         thw = thw1.to(self.device).repeat(4 * n, 1)
-        tok = core.model.embed_tokens(input_ids)
-        img = enc["image_embeds"].to(tok.dtype).repeat_interleave(4, dim=0).reshape(-1, tok.shape[-1])
-        is_img = (input_ids == core.config.image_token_id).unsqueeze(-1).expand_as(tok)
-        tok = tok.masked_scatter(is_img, img)
-        pos, _ = core.get_rope_index(input_ids, thw, None, attn)
-        hidden = core.model(input_ids=None, attention_mask=attn, position_ids=pos, inputs_embeds=tok,
-                            use_cache=False).last_hidden_state[:, -1]
+        tok = lm.embed_tokens(input_ids)
+        d = tok.shape[-1]
+        img = enc["image_embeds"].to(tok.dtype).repeat_interleave(4, dim=0).reshape(-1, d)
+        is_img = input_ids == core.config.image_token_id
+        tok = tok.masked_scatter(is_img.unsqueeze(-1).expand_as(tok), img)
+        pos, _ = rope(input_ids, thw, None, attn)
+        extra = {}
+        if "deepstack" in enc:  # Qwen3-VL adds multi-level vision features inside early decoder layers
+            extra = {"visual_pos_masks": is_img,
+                     "deepstack_visual_embeds": [x.to(tok.dtype).repeat_interleave(4, dim=0).reshape(-1, d)
+                                                 for x in enc["deepstack"]]}
+        cache_pos = torch.arange(input_ids.shape[1], device=self.device)
+        hidden = lm(input_ids=None, attention_mask=attn, position_ids=pos, inputs_embeds=tok, use_cache=False,
+                    cache_position=cache_pos, **extra).last_hidden_state[:, -1]
         w = core.lm_head.weight[self.letter_ids]
         logits = (hidden.to(w.dtype) @ w.T).float()
         return logits.view(n, 4, len(LETTERS))
@@ -285,15 +316,30 @@ def _save(model, out_dir: Path, base: str, args, fallback, acc):
 
 # ── inference: all VLM members share one base model ─────────────────────────────
 
-class VLMEnsemble:
-    """Loads the base once and switches LoRA adapters per member."""
+def base_dir_name(base: str) -> str:
+    """Folder name under model/vlm_base/ for a hub id, e.g. Qwen/Qwen3-VL-2B-Instruct -> Qwen__Qwen3-VL-2B-Instruct."""
+    return base.strip("/").replace("/", "__")
 
-    def __init__(self, member_dirs: list[Path], device, vlm_base_dir: Path | None):
+
+def resolve_base(base: str, vlm_base_dir: Path | None) -> str:
+    """Baked-in local copy if present (container has no network), else the hub id (dev boxes)."""
+    if vlm_base_dir:
+        sub = vlm_base_dir / base_dir_name(base)
+        if (sub / "config.json").exists():
+            return str(sub)
+        if (vlm_base_dir / "config.json").exists():  # legacy single-base layout
+            return str(vlm_base_dir)
+    return base
+
+
+class _BaseGroup:
+    """One base model with all its LoRA adapters; vision features shared across adapters."""
+
+    def __init__(self, base: str, member_dirs: list[Path], device, vlm_base_dir: Path | None, image_size: int):
         from peft import PeftModel
 
-        metas = [json.loads((d / META).read_text()) for d in member_dirs]
-        base = str(vlm_base_dir) if vlm_base_dir and (vlm_base_dir / "config.json").exists() else metas[0]["base"]
-        self.clf = VLMClassifier(base, device, image_size=metas[0].get("image_size", 448))
+        path = resolve_base(base, vlm_base_dir)
+        self.clf = VLMClassifier(path, device, image_size=image_size)
         self.names = []
         pm = None
         for d in member_dirs:
@@ -302,18 +348,31 @@ class VLMEnsemble:
                 pm = PeftModel.from_pretrained(self.clf.model, str(d), adapter_name=name)
             else:
                 pm.load_adapter(str(d), adapter_name=name)
-            self.names.append(name)
+            self.names.append((name, d.name))
         self.clf.model = pm.eval()
-        self.fallback = metas[0].get("fallback")
+        log.info("vlm members %s on base %s", [n for _, n in self.names], path)
+
+
+class VLMEnsemble:
+    """VLM members grouped by base model (e.g. Qwen2-VL-2B and Qwen3-VL-2B adapters side by side)."""
+
+    def __init__(self, member_dirs: list[Path], device, vlm_base_dir: Path | None):
+        metas = {d: json.loads((d / META).read_text()) for d in member_dirs}
+        groups: dict[str, list[Path]] = {}
+        for d in member_dirs:
+            groups.setdefault(metas[d]["base"], []).append(d)
+        self.groups = [_BaseGroup(b, ds, device, vlm_base_dir, metas[ds[0]].get("image_size", 448))
+                       for b, ds in groups.items()]
+        self.fallback = metas[member_dirs[0]].get("fallback")
         self.tta = os.environ.get("D2_VLM_TTA", "1") != "0"
-        log.info("vlm members %s on base %s", self.names, base)
 
     def member_probs(self, images):
-        """-> list of (name, probs tensor (N,4,4)) one per adapter."""
+        """-> list of (member dir name, probs tensor (N,4,4)) one per adapter."""
         out = []
-        with self.clf.torch.inference_mode():
-            views = self.clf.encode_views(images, self.tta)  # vision once, shared by every adapter
-            for name in self.names:
-                self.clf.model.set_adapter(name)
-                out.append((name, self.clf.probs_from(views)))
+        for g in self.groups:
+            with g.clf.torch.inference_mode():
+                views = g.clf.encode_views(images, self.tta)  # vision once, shared by every adapter
+                for adapter, dname in g.names:
+                    g.clf.model.set_adapter(adapter)
+                    out.append((dname, g.clf.probs_from(views)))
         return out

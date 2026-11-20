@@ -32,7 +32,7 @@ for d in "$WORK"/runs/*/; do n=$(basename "$d"); grep -E "val_acc|CV overall|Err
 echo "=== ASSEMBLE + INFERENCE WITH SUBMISSION PINS $(date -u +%T)"
 python scripts/bakeoff.py assemble --runs "$WORK/runs" --out model/weights_bake
 if ls model/weights_bake/*/vlm_meta.json >/dev/null 2>&1; then
-  python -c "from huggingface_hub import snapshot_download as s; s('Qwen/Qwen2-VL-2B-Instruct', local_dir='model/vlm_base')"
+  python -c "import glob,json;from pathlib import Path;from huggingface_hub import snapshot_download as s;from d2qual.vlm_ft import base_dir_name as b;[s(x, local_dir=str(Path('model/vlm_base')/b(x))) for x in sorted({json.load(open(m))['base'] for m in glob.glob('model/weights_bake/*/vlm_meta.json')})]"
 fi
 [ -f model/pose/keypointrcnn.pth ] || python -m d2qual.pose --save-weights model/pose/keypointrcnn.pth
 pip install -q -r requirements.txt 2>&1 | grep -v "Running pip as" | tail -1

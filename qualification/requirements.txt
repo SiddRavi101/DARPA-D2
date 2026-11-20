@@ -6,7 +6,7 @@
 # it only runs when no trained checkpoint exists, which never happens in a real
 # submission, and transformers would add GBs to the image and ClamAV scan time.
 # Training-only deps live in requirements-train.txt.
-timm==1.0.12
-huggingface_hub==0.26.2
+timm==1.0.20
+huggingface_hub==0.35.3
 safetensors==0.4.5
 pillow==10.4.0

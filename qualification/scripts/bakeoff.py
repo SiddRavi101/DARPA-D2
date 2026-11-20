@@ -43,7 +43,11 @@ CANDIDATES: dict[str, list[str]] = {
     "siglip_b": ["--backbone", "vit_base_patch16_siglip_384.webli", "--size", "384", *VIT_LR],
     "convnext_s_limb": ["--backbone", "convnext_small.fb_in22k_ft_in1k_384", "--size", "512", "--limb-crops"],
     "dinov2_b_limb": ["--backbone", "vit_base_patch14_dinov2.lvd142m", "--size", "518", "--limb-crops", *VIT_LR],
+    "siglip2_b": ["--backbone", "vit_base_patch16_siglip_384.v2_webli", "--size", "384", *VIT_LR],
     "vlm_qwen2vl_2b": ["--backbone", "vlm:Qwen/Qwen2-VL-2B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
+    # Qwen3-VL (Oct 2025, Apache-2.0): newer generation, needs transformers >= 4.57
+    "vlm_qwen3vl_2b": ["--backbone", "vlm:Qwen/Qwen3-VL-2B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
+    "vlm_qwen3vl_4b": ["--backbone", "vlm:Qwen/Qwen3-VL-4B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
 }
 
 

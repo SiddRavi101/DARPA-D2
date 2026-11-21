@@ -240,15 +240,20 @@ def test_limb_crops_follow_anatomical_side_and_mirror():
         for y in range(160):
             img.putpixel((x, y), (255, 0, 0))
     crops, feats = limb_crops(img, _fake_kps(), 32)
-    assert len(crops) == 4 and feats.shape == (4, 4) and feats[:, 3].tolist() == [1, 1, 1, 1]
+    assert len(crops) == 4 and feats.shape == (4, 6) and feats[:, 3].tolist() == [1, 1, 1, 1]
     red = [np.asarray(c)[..., 0].mean() for c in crops]
     assert red[0] > red[1] and red[2] > red[3]  # left limbs are on the red side
     mc, mf = mirror_limb_inputs(crops, feats)
-    # after mirroring, the "left arm" crop is the mirrored right-arm crop
-    assert np.array_equal(np.asarray(mc[0]), np.asarray(crops[1])[:, ::-1])
+    # crops are canonical (left mirrored), so a photo mirror is a pure site swap
+    assert np.array_equal(np.asarray(mc[0]), np.asarray(crops[1]))
     assert np.array_equal(mf, feats[[1, 0, 3, 2]])
     blank, f0 = limb_crops(img, None, 32)
     assert f0.sum() == 0 and len(blank) == 4
+    # amputee: shoulder found, elbow and wrist missing -> anchor-only crop around the stump
+    kp_a = _fake_kps().copy()
+    kp_a[[7, 9], 2] = 0.0  # left elbow, left wrist
+    _, fa = limb_crops(img, kp_a, 32)
+    assert fa[0, 3] == 1 and fa[0, 4] == 1 and fa[1, 4] == 0
 
 
 def test_limb_crop_model_trains_and_predicts(image_dir, tmp_path):

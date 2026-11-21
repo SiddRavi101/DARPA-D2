@@ -93,12 +93,13 @@ class InjuryNet(nn.Module):
 
 
 def mirror_inputs(x: torch.Tensor, crops: torch.Tensor | None = None, kp_feats: torch.Tensor | None = None):
-    """Mirror a batch: flip the image; for limb inputs also swap sites and flip each crop."""
+    """Mirror a batch: flip the image and swap sites. Crops are already canonical (left limbs
+    mirrored), so a photo mirror only permutes them - see data.mirror_limb_inputs."""
     xm = torch.flip(x, dims=[3])
     if crops is None:
         return xm, None, None
     perm = list(FLIP_PERMUTATION)
-    return xm, torch.flip(crops[:, perm], dims=[4]), kp_feats[:, perm]
+    return xm, crops[:, perm], kp_feats[:, perm]
 
 
 def flip_logits(logits: torch.Tensor) -> torch.Tensor:

@@ -186,10 +186,12 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
                     persistent_workers=args.workers > 0)
     vl = DataLoader(va, batch_size=args.batch, shuffle=False, num_workers=args.workers) if val_ids else None
 
-    params = [
-        {"params": model.backbone.parameters(), "lr": args.lr * args.backbone_lr_mult},
-        {"params": model.head.parameters(), "lr": args.lr},
-    ]
+    frozen = args.backbone_lr_mult == 0  # frozen-feature probe: only the head trains
+    if frozen:
+        model.backbone.requires_grad_(False)
+    params = [{"params": model.head.parameters(), "lr": args.lr}]
+    if not frozen:
+        params.insert(0, {"params": model.backbone.parameters(), "lr": args.lr * args.backbone_lr_mult})
     opt = torch.optim.AdamW(params, weight_decay=args.wd)
     steps = args.epochs * max(1, len(tl))
     warm = max(1, int(0.05 * steps))
@@ -203,6 +205,8 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
     fallback = class_prior({i: labels[i] for i in train_ids})
     for epoch in range(args.epochs):
         model.train()
+        if frozen:
+            model.backbone.eval()  # no dropout / drop-path noise in frozen features
         t0, running = time.time(), 0.0
         for batch in tl:
             inputs, y = _unpack(batch, device)
@@ -248,7 +252,8 @@ def main(argv=None) -> None:
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--backbone-lr-mult", type=float, default=0.1)
+    ap.add_argument("--backbone-lr-mult", type=float, default=0.1,
+                    help="0 = freeze the backbone (linear/MLP probe on frozen features)")
     ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--label-smoothing", type=float, default=0.05)
     ap.add_argument("--folds", type=int, default=5, help="k for k-fold; 1 = train on all data, no val")

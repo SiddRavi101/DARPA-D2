@@ -250,7 +250,12 @@ def _augment(img: Image.Image, rng: random.Random) -> Image.Image:
 # missing limb is evidence for not_testable / amputation, and falls back to the global view.
 
 KP_CONF_MIN = 0.35
-N_KP_FEATS = 4  # [conf proximal, conf middle, conf distal, crop present]
+# Per-site pose evidence fed to the classifier (Approach B in Rohan's plan):
+#   [conf proximal, conf middle, conf distal, crop present, anchor-only crop, fraction of crop outside image]
+# "anchor-only" = only the shoulder/hip was found: likely a stump or a hidden limb. The out-of-frame
+# fraction separates "limb runs off the image" (not_testable) from "limb ends at a stump" (amputation).
+N_KP_FEATS = 6
+LEFT_SITES = (0, 2)  # SITES order: left arm, right arm, left leg, right leg
 _FILL = (124, 116, 104)
 
 
@@ -263,8 +268,21 @@ def _body_scale(kps) -> float:
     return max(d) if d else 0.0
 
 
+def _outside_fraction(box, w, h) -> float:
+    x0, y0, x1, y1 = box
+    area = max(1e-6, (x1 - x0) * (y1 - y0))
+    ix = max(0.0, min(x1, w) - max(x0, 0.0))
+    iy = max(0.0, min(y1, h) - max(y0, 0.0))
+    return float(1.0 - ix * iy / area)
+
+
 def limb_boxes(kps, img_size):
-    """kps (17,3) in image pixels -> 4 boxes (x0,y0,x1,y1) or None, plus (4, N_KP_FEATS) features."""
+    """kps (17,3) in image pixels -> 4 boxes (x0,y0,x1,y1) or None, plus (4, N_KP_FEATS) features.
+
+    Boxes are anchored on the proximal joint (shoulder / hip), which survives amputation: when only
+    the anchor is found, the crop is a square around it big enough to hold a stump, so the
+    classifier still sees blood / a severed end instead of a blank tile.
+    """
     import numpy as np
 
     from .pose import KP, LIMB_CHAINS
@@ -278,7 +296,14 @@ def limb_boxes(kps, img_size):
         feats[s, :3] = conf
         vis = [i for i, c in zip(idx, conf) if c >= KP_CONF_MIN]
         if len(vis) < 2:
-            boxes.append(None)
+            if conf[0] >= KP_CONF_MIN:  # anchor only: stump or hidden limb
+                cx, cy = kps[idx[0], :2].astype(np.float64)
+                side = 0.9 * scale
+                box = (cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2)
+                boxes.append(box)
+                feats[s, 3], feats[s, 4], feats[s, 5] = 1.0, 1.0, _outside_fraction(box, w, h)
+            else:
+                boxes.append(None)
             continue
         pts = kps[vis, :2].astype(np.float64)
         if kps[idx[2], 2] >= KP_CONF_MIN and kps[idx[1], 2] >= KP_CONF_MIN:  # add the hand / foot
@@ -288,8 +313,9 @@ def limb_boxes(kps, img_size):
         x1, y1 = pts.max(0)
         side = max(x1 - x0, y1 - y0) + 0.5 * scale
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        boxes.append((cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2))
-        feats[s, 3] = 1.0
+        box = (cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2)
+        boxes.append(box)
+        feats[s, 3], feats[s, 5] = 1.0, _outside_fraction(box, w, h)
     return boxes, feats
 
 
@@ -316,12 +342,17 @@ def limb_crops(img: Image.Image, kps, size: int, rng: Optional[random.Random] = 
     if kps is None:
         kps = np.zeros((17, 3), np.float32)
     boxes, feats = limb_boxes(kps, img.size)
-    return [crop_box(img, b, size, rng) for b in boxes], feats
+    crops = [crop_box(img, b, size, rng) for b in boxes]
+    # Canonical orientation: left-limb crops are mirrored to look like right limbs, so the shared
+    # classifier only learns "arm" / "leg"; laterality comes from pose, not the classifier.
+    crops = [ImageOps.mirror(c) if s in LEFT_SITES else c for s, c in enumerate(crops)]
+    return crops, feats
 
 
 def mirror_limb_inputs(crops: list, feats):
-    """Mirror the photo => anatomical sides swap: permute sites and mirror each crop."""
-    return [ImageOps.mirror(crops[i]) for i in FLIP_PERMUTATION], feats[list(FLIP_PERMUTATION)]
+    """Mirror the photo => anatomical sides swap. With canonical (left-mirrored) crops this is a
+    pure site permutation: the new left crop is mirror(mirror(old right)) = the old right crop."""
+    return [crops[i] for i in FLIP_PERMUTATION], feats[list(FLIP_PERMUTATION)]
 
 
 def to_tensor(img: Image.Image, mean, std):

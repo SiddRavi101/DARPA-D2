@@ -96,6 +96,14 @@ Scores are from the Nov 20 COCO re-test, where every fold keeps its final epoch.
 | EVA02-B | `eva02_b` | Image classifier | 0.870 | Best plain image model |
 | SigLIP-B | `siglip_b` | Image classifier | 0.869 | Fastest (2 min on COCO) |
 
+- **Rohan's approaches (also in the bake-off, same folds):** frozen DINOv2 with registers. DINOv3 is ruled out because its licence excludes military use.
+
+  | Approach | `bakeoff.py` names | What it is |
+  |---|---|---|
+  | **A**: whole image, 4 heads | `dinov2_b_reg_probe`, `dinov2_l_reg_probe` | Frozen backbone on the whole image; only the 4 site heads train. |
+  | **B**: localize, then classify | `dinov2_b_reg_limb_probe`, `dinov2_l_reg_limb_probe` | Pose finds each limb. Each crop is 448 px and anchored on the shoulder or hip, so a stump stays in the crop even when the elbow or knee is missing. Left crops are mirrored so one shared classifier sees only "arm" or "leg". The classifier also gets keypoint confidences, an anchor-only flag and the fraction of the crop that falls outside the image (amputation vs out of view). |
+
+  Not yet built from his plan: RTMW pose (we use Keypoint R-CNN), cached features, LoRA on ViT-L, pseudo-labelling.
 - **Backup:** Qwen2-VL-2B (`vlm_qwen2vl_2b`, 0.887) and ConvNeXt-S (`convnext_s`, 0.860).
 - **Dropped:** SigLIP 2-B (0.801; would need its own learning rate) and DINOv2-B (0.770).
 - **On hold:** pose-guided limb crops (`convnext_s_limb`, 0.827). Retest only if errors show that wounds need close-up detail, or that left/right is the main error.

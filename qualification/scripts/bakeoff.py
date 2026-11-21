@@ -41,6 +41,20 @@ CANDIDATES: dict[str, list[str]] = {
     "eva02_b": ["--backbone", "eva02_base_patch14_448.mim_in22k_ft_in22k_in1k", "--size", "448", *VIT_LR],
     "dinov2_b": ["--backbone", "vit_base_patch14_dinov2.lvd142m", "--size", "518", *VIT_LR],
     "siglip_b": ["--backbone", "vit_base_patch16_siglip_384.webli", "--size", "384", *VIT_LR],
+    # Frozen DINOv2 (Apache-2.0; DINOv3 is barred: its licence excludes military use).
+    # Backbone frozen (--backbone-lr-mult 0), only the head trains -> cheap probes.
+    "dinov2_b_reg_probe": ["--backbone", "vit_base_patch14_reg4_dinov2.lvd142m", "--size", "518",
+                           "--backbone-lr-mult", "0", "--lr", "1e-3"],
+    "dinov2_l_reg_probe": ["--backbone", "vit_large_patch14_reg4_dinov2.lvd142m", "--size", "518",
+                           "--backbone-lr-mult", "0", "--lr", "1e-3"],
+    # Rohan's plan: Approach A = whole image, frozen backbone, 4 heads (dinov2_*_reg_probe above).
+    # Approach B = pose -> shoulder/hip-anchored crop per limb (left crops mirrored) -> one shared
+    # classifier with keypoint-confidence + out-of-frame features. 448 px crops keep wound detail.
+    "dinov2_b_reg_limb_probe": ["--backbone", "vit_base_patch14_reg4_dinov2.lvd142m", "--size", "518",
+                                "--limb-crops", "--crop-size", "448", "--backbone-lr-mult", "0", "--lr", "1e-3"],
+    "dinov2_l_reg_limb_probe": ["--backbone", "vit_large_patch14_reg4_dinov2.lvd142m", "--size", "518",
+                                "--limb-crops", "--crop-size", "448", "--backbone-lr-mult", "0", "--lr", "1e-3",
+                                "--batch", "8"],
     "convnext_s_limb": ["--backbone", "convnext_small.fb_in22k_ft_in1k_384", "--size", "512", "--limb-crops"],
     "dinov2_b_limb": ["--backbone", "vit_base_patch14_dinov2.lvd142m", "--size", "518", "--limb-crops", *VIT_LR],
     "siglip2_b": ["--backbone", "vit_base_patch16_siglip_384.v2_webli", "--size", "384", *VIT_LR],

@@ -34,8 +34,10 @@ from d2qual.data import load_label_groups, load_labels, match_images  # noqa: E4
 from d2qual.schema import CLASSES, SITE_KEYS  # noqa: E402
 
 DEFAULT_CANDIDATES = (
-    "vlm_qwen3vl_2b,vlm_qwen3vl_4b,eva02_b,siglip_b,"  # COCO re-test 2026-11-20 (PLAN.md)
-    "dinov2_l_reg_probe,dinov2_b_reg_limb_probe,dinov2_l_reg_limb_probe"  # Rohan's approaches A and B
+    # fast first, so leaderboard rows arrive early; VLMs (slowest) last
+    "eva02_b,siglip_b,"  # COCO re-test 2026-11-20 (PLAN.md)
+    "dinov2_l_reg_probe,dinov2_b_reg_limb_probe,dinov2_l_reg_limb_probe,"  # Rohan's approaches A and B
+    "vlm_qwen3vl_2b,vlm_qwen3vl_4b"
 )
 BUDGET_S = 50 * 60  # predict.py's own wall-clock budget inside DARPA's 1 h
 

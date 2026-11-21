@@ -33,10 +33,11 @@ For each manikin photo we label four limb sites as `no_injury`, `wound`, `amputa
    - image sizes
    - candidate scene/manikin groupings guessed from filenames
 2. **Choose the grouping** (a person decides). Photos of the same manikin or scene must stay in one fold. Otherwise near-duplicates leak across folds and inflate every score. `run` refuses to start without `--group-regex`, `--groups-file` or `--no-groups`.
+   - **DARPA's labels carry `casualty_id`** (62 casualties). `inspect` writes `groups.csv` from it, so use `--groups-file <work>/groups.csv`.
 3. **Bake-off.**
 
    ```
-   python scripts/day_one.py run --images I --labels L --group-regex '...'
+   python scripts/day_one.py run --images I --labels L --groups-file <work>/groups.csv
    ```
 
    - All candidates train on **identical** grouped folds: 5 folds × 15 epochs.
@@ -83,7 +84,7 @@ This is an outside check that the locked ensemble works on a **manikin** it has 
 
 ## Candidates
 
-The main four run in the bake-off; the DARPA data decides what ships. Every candidate uses:
+Seven candidates run in round 1: the four below plus three of Rohan's (next list). The DARPA data decides what ships. Every candidate uses:
 - mirror-flip augmentation and test-time augmentation that **swap the left/right labels** with the image;
 - letterboxing, never random crops, because a crop can cut a limb out of frame.
 
@@ -104,8 +105,12 @@ Scores are from the Nov 20 COCO re-test, where every fold keeps its final epoch.
   | **B**: localize, then classify | `dinov2_b_reg_limb_probe`, `dinov2_l_reg_limb_probe` | Pose finds each limb. Each crop is 448 px and anchored on the shoulder or hip, so a stump stays in the crop even when the elbow or knee is missing. Left crops are mirrored so one shared classifier sees only "arm" or "leg". The classifier also gets keypoint confidences, an anchor-only flag and the fraction of the crop that falls outside the image (amputation vs out of view). |
 
   Not yet built from his plan: RTMW pose (we use Keypoint R-CNN), cached features, LoRA on ViT-L, pseudo-labelling.
+
+  Round 1 runs `dinov2_l_reg_probe` (A), `dinov2_b_reg_limb_probe` and `dinov2_l_reg_limb_probe` (B). `dinov2_b_reg_probe` is available but not in the default run.
+  - **Watch:** Approach B takes left/right from the pose model (Keypoint R-CNN). Our Nov 18 checks found front/back confusion on synthetic casualties. A prone/supine flip would swap both sides of a crop, so check B's left/right swap count in the error review against the whole-image models.
+  - **Compliance:** Shravan's v2 plan listed DINOv2 and COCO-trained pose models as "not until DARPA OKs". Using them is now a team decision, and it stays on the DARPA question list below.
 - **Backup:** Qwen2-VL-2B (`vlm_qwen2vl_2b`, 0.887) and ConvNeXt-S (`convnext_s`, 0.860).
-- **Dropped:** SigLIP 2-B (0.801; would need its own learning rate) and DINOv2-B (0.770).
+- **Dropped:** SigLIP 2-B (0.801; would need its own learning rate) and fully fine-tuned DINOv2-B (0.770). Rohan's frozen DINOv2-with-registers probes are a different setup and stay in.
 - **On hold:** pose-guided limb crops (`convnext_s_limb`, 0.827). Retest only if errors show that wounds need close-up detail, or that left/right is the main error.
 - The best COCO ensemble was half Qwen3-VL-4B, half Qwen3-VL-2B: 0.898. It needs about 69 min per 2,000 images with TTA, so TTA off or fewer adapters is required.
 - COCO has no wound or amputation classes, so these numbers only screen candidates; they don't predict the DARPA score. See [coco_retest](results/coco_retest_2026-11-20.md) and [coco_bakeoff](results/coco_bakeoff_2026-11-18.md).
@@ -117,22 +122,31 @@ Scores are from the Nov 20 COCO re-test, where every fold keeps its final epoch.
 
 ## Compute and cost
 
-Training runs on Runpod Secure Cloud A40s (48 GB, $0.59/hr). That's the card our speed figures come from, and one of DARPA's evaluation GPUs. Cost grows in proportion to the number of labelled photos:
+Training runs on Runpod Secure Cloud A40s (48 GB, $0.59/hr). That's the card our speed figures come from, and one of DARPA's evaluation GPUs.
 
-| Labelled photos | 3 image models | + VLM | Total A40 time | Cost |
-|---|---|---|---|---|
-| 2,000 | ~2.3 h | ~2 h | ~4.5 h | ~$2.70 |
-| 5,000 | ~5.8 h | ~5 h | ~11 h | ~$6.50 |
-| 10,000 | ~11.5 h | ~10 h | ~22 h | ~$13 |
+**Dataset (inspected 2026-11-21):** 952 labelled photos (mostly 4032×3024) from 62 casualties. 235 labelled videos are not used yet. The majority-class floor is 0.570. The test set should be about 190 photos (20% of train), so the 1-hour limit is easy.
 
-- Add 20–30% for reruns and the final container test.
-- Running candidates on parallel pods cuts the wait to the slowest model, at the same total cost.
-- Budget: up to $30 for Part 2, which covers two full rounds.
-- If DARPA rules that a rented GPU is not "our own systems" (Rules §6.1), train on AWS **spot** GPUs on our own server instead, at about the same cost per run.
+**Round 1 estimate** (5 grouped folds; 15 epochs for image models, 3 for VLMs). These are scaled from the COCO runs, not measured:
+
+| Candidate | Approx. A40 time |
+|---|---|
+| `eva02_b`, `siglip_b` | ~0.5 h together |
+| `dinov2_l_reg_probe` (A) | ~0.4 h |
+| `dinov2_b_reg_limb_probe` (B) | ~0.7 h |
+| `dinov2_l_reg_limb_probe` (B) | ~2 h (frozen ViT-L on 5 views per photo, no feature cache) |
+| `vlm_qwen3vl_2b` | ~1.5 h |
+| `vlm_qwen3vl_4b` | ~2.7 h |
+| **Total** | **~8 h, about $5** |
+
+- The fast candidates run first, so their leaderboard rows arrive early.
+- Splitting candidates across two pods halves the wait for the same cost. Use them both on the same network volume.
+- Budget: up to $30 for Part 2, which covers two full rounds plus the container test.
+- **Where it runs:** Runpod CA-MTL-1 (Montreal), network volume `d2-darpa-data` (`au3pwf2vfu`). It's the only North American data center with A40s and network volumes on Nov 21.
+- If DARPA rules that a rented GPU is not "our own systems" (Rules §6.1), train on AWS instead. The g5 box waits on a Paid-plan upgrade and GPU quota.
 
 ## Timeline
 
-1. **Nov 21:** get server access, run `inspect`, pick the grouping, and email DARPA the cloud-GPU question.
+1. **Nov 21:** data on the Runpod volume (checksum OK), `inspect` done, grouping = `casualty_id`. Email DARPA the cloud-GPU question.
 2. **Nov 22:** bake-off round 1 (image models and VLM in parallel). GitLab dry-run push with a placeholder image.
 3. **Nov 23–24:** error review, targeted fixes, round 2 on the top candidates.
 4. **Nov 25:** lock the ensemble, run the timing check, then the one-time Mannequin In-Bed blind test.
@@ -146,7 +160,7 @@ Training runs on Runpod Secure Cloud A40s (48 GB, $0.59/hr). That's the card our
 | Wrong or missing grouping inflates scores | `run` requires an explicit grouping; check it in the inspect report |
 | Label format our reader doesn't parse | `inspect` fails on day one; add a reader in `d2qual/data.py` |
 | Ensemble too slow | Timing check before submitting; turn off VLM TTA or drop members |
-| Left/right confusion | Side-swapping mirror augmentation; review counts left/right swaps |
+| Left/right confusion | Side-swapping mirror augmentation; review counts left/right swaps. Approach B inherits pose-model side errors, so compare its swap count. |
 | GitLab 5-member cap | Remove the Duo Code Review bot; 3 of us + `@D2-evaluator` = 4 |
 
 ## Open questions for DARPA (D2Sprint@darpa.mil)

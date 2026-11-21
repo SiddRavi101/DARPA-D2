@@ -483,3 +483,15 @@ def test_heic_named_png_decodes_when_pillow_heif_present(tmp_path):
     assert open(p, "rb").read(12)[4:8] == b"ftyp"
     im = load_image(p)
     assert im.size == (64, 48) and im.mode == "RGB"
+
+
+def test_match_images_prefers_exact_name_over_shared_stem(tmp_path):
+    d = tmp_path / "imgs"
+    d.mkdir()
+    Image.new("RGB", (8, 8)).save(d / "1009.jpg")
+    Image.new("RGB", (8, 8)).save(d / "1009.png")  # twin with the same stem (HEIC in DARPA's set)
+    Image.new("RGB", (8, 8)).save(d / "0001.jpg")
+    lab = ["no_injury"] * 4
+    got = match_images(d, {"images/1009.jpg": lab, "images/0001": lab})
+    assert set(got) == {"1009.jpg", "0001.jpg"}
+    assert match_images(d, {"1009": lab}) == {}  # ambiguous stem -> no guess

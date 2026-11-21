@@ -107,8 +107,8 @@ def cmd_inspect(a) -> None:
     lines += ["", "## Candidate groupings (pick one - or none - and pass it to `run`)", ""]
     lg = load_label_groups(a.labels)
     if lg:
-        on_disk = {Path(i).stem.lower(): i for i in ids}
-        gmap = {on_disk[Path(k).stem.lower()]: g for k, g in lg.items() if Path(k).stem.lower() in on_disk}
+        by_name = {i.lower(): i for i in ids}
+        gmap = {by_name[Path(k).name.lower()]: g for k, g in lg.items() if Path(k).name.lower() in by_name}
         gfile = work / "groups.csv"
         gfile.write_text("image_id,group" + chr(10) + "".join(f"{k},{v}" + chr(10) for k, v in sorted(gmap.items())), encoding="utf-8")
         sizes = sorted(Counter(gmap.values()).values(), reverse=True)

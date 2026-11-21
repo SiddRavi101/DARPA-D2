@@ -447,10 +447,13 @@ def match_images(image_dir, labels: dict[str, list[str]]) -> dict[str, list[str]
     """
     on_disk = [p.name for p in list_images(image_dir)]
     by_lower = {n.lower(): n for n in on_disk}
-    by_stem = {Path(n).stem.lower(): n for n in on_disk}
+    by_stem: dict[str, str] = {}
+    for n in on_disk:  # a stem shared by two files (1009.jpg + 1009.png) is ambiguous: never stem-match it
+        by_stem[Path(n).stem.lower()] = None if Path(n).stem.lower() in by_stem else n  # type: ignore[assignment]
     out: dict[str, list[str]] = {}
     for iid, lab in labels.items():
-        name = by_lower.get(iid.lower()) or by_stem.get(Path(iid).stem.lower())
+        # exact name, then basename of a path label ("images/0001.jpg"), then an unambiguous stem
+        name = by_lower.get(iid.lower()) or by_lower.get(Path(iid).name.lower()) or by_stem.get(Path(iid).stem.lower())
         if name:
             out[name] = lab
     return dict(sorted(out.items()))

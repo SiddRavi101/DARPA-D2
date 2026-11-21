@@ -472,3 +472,14 @@ def test_darpa_style_csv_skips_videos_and_yields_groups(tmp_path):
     assert set(lab) == {"images/a.jpg", "images/b.png"}
     assert lab["images/a.jpg"] == ["no_injury", "wound", "amputation", "not_testable"]
     assert load_label_groups(p) == {"images/a.jpg": "c1", "images/b.png": "c2"}
+
+
+def test_heic_named_png_decodes_when_pillow_heif_present(tmp_path):
+    pillow_heif = pytest.importorskip("pillow_heif")
+    from d2qual.data import load_image
+
+    p = tmp_path / "1009.png"  # HEIC bytes with a .png name, as in DARPA's training set
+    pillow_heif.from_pillow(Image.new("RGB", (64, 48), (200, 30, 30))).save(str(p), format="HEIF")
+    assert open(p, "rb").read(12)[4:8] == b"ftyp"
+    im = load_image(p)
+    assert im.size == (64, 48) and im.mode == "RGB"

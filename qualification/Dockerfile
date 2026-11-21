@@ -35,6 +35,6 @@ RUN if ls model/weights/*/vlm_meta.json >/dev/null 2>&1; then \
         pip install --no-cache-dir -r requirements-vlm.txt && rm -rf /root/.cache \
         && python -c "import transformers, peft; print('vlm deps ok')"; fi \
     && chmod +x entrypoint.sh && mkdir -p /app/input /app/output \
-    && python -c "import d2qual.predict, d2qual.pose, timm, torchvision, PIL; print('import ok')"
+    && python -c "import d2qual.predict, d2qual.pose, timm, torchvision, PIL, pillow_heif; from d2qual.data import HEIF_OK; assert HEIF_OK; print('import ok')"
 
 ENTRYPOINT ["/app/entrypoint.sh"]

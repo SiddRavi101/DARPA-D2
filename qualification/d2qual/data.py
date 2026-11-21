@@ -209,6 +209,19 @@ def class_prior(labels: dict[str, list[str]]) -> list[str]:
 
 # ── Image preprocessing ───────────────────────────────────────────────────────
 
+# DARPA's training set contains iPhone HEIC photos saved with a .png extension (file header
+# "ftypheic"). Plain Pillow cannot open them, so register the HEIF decoder when available; the
+# submission image installs pillow-heif (requirements.txt) so such test images get real predictions
+# instead of the not_testable fallback.
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIF_OK = True
+except ImportError:  # pragma: no cover - dev boxes without pillow-heif
+    HEIF_OK = False
+
+
 def load_image(path: str | Path) -> Image.Image:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)  # phone photos: honour EXIF rotation

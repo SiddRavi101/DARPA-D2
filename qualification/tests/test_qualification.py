@@ -495,3 +495,90 @@ def test_match_images_prefers_exact_name_over_shared_stem(tmp_path):
     got = match_images(d, {"images/1009.jpg": lab, "images/0001": lab})
     assert set(got) == {"1009.jpg", "0001.jpg"}
     assert match_images(d, {"1009": lab}) == {}  # ambiguous stem -> no guess
+
+
+# ── stacker, pooling, VLM close-ups, video frames ──────────────────────────────
+
+def test_stacker_learns_which_model_to_trust_per_class():
+    import numpy as np
+
+    from d2qual import stack
+
+    rng = np.random.default_rng(0)
+    n = 300
+    y = rng.integers(0, 4, (n, 4))
+    onehot = np.eye(4)[y]
+    noise = lambda: rng.dirichlet(np.ones(4), (n, 4))  # noqa: E731
+    # model A is right about classes 0/3 and confidently wrong (says 1 or 2) otherwise; B the reverse.
+    # Averaging is then a coin flip on every limb; a per-class combiner learns whose vote to trust.
+    wrong_a = np.eye(4)[rng.choice([1, 2], (n, 4))]
+    wrong_b = np.eye(4)[rng.choice([0, 3], (n, 4))]
+    a = np.where(np.isin(y, [0, 3])[..., None], 0.7 * onehot, 0.7 * wrong_a) + 0.3 * noise()
+    b = np.where(np.isin(y, [1, 2])[..., None], 0.7 * onehot, 0.7 * wrong_b) + 0.3 * noise()
+    folds = [np.arange(k, n, 5) for k in range(5)]
+    acc, oof = stack.nested_accuracy([a, b], y, folds, 1e-3)
+    avg = float((((a + b) / 2).argmax(-1) == y).mean())
+    assert oof.shape == (n, 4, 4) and np.allclose(oof.sum(-1), 1)
+    assert acc > avg + 0.05, (acc, avg)
+
+
+def test_pooling_shares_injury_but_keeps_visibility():
+    import numpy as np
+
+    from d2qual.stack import pool_by_group
+
+    p = np.full((3, 4, 4), 0.25)
+    p[0, 0] = [0.05, 0.05, 0.85, 0.05]  # photo 0 clearly shows an amputated left arm
+    p[1, 0] = [0.5, 0.2, 0.2, 0.1]      # photo 1 of the same casualty is unsure
+    p[2, 0] = [0.02, 0.02, 0.02, 0.94]  # photo 2: limb hidden
+    out = pool_by_group(p, ["c1", "c1", "c1"], 1.0)
+    assert out[1, 0].argmax() == 2 and out[2, 0].argmax() == 3
+    assert np.allclose(out.sum(-1), 1) and np.allclose(out[:, :, 3], p[:, :, 3])
+    assert np.allclose(pool_by_group(p, [None, None, None]), p)
+
+
+def test_cluster_groups_similar_embeddings():
+    import numpy as np
+
+    from d2qual.predict import cluster
+
+    e = np.array([[1, 0, 0], [0.99, 0.1, 0], [0, 1, 0], [0, 0.98, 0.2]], float)
+    e /= np.linalg.norm(e, axis=1, keepdims=True)
+    c = cluster(e, 0.9)
+    assert c[0] == c[1] and c[2] == c[3] and c[0] != c[2]
+
+
+def test_vlm_crop_prompts_and_mirrored_crops():
+    from d2qual.schema import FLIP_PERMUTATION
+    from d2qual.vlm_ft import _content, mirror_view_crops, vlm_crops
+
+    assert sum(x["type"] == "image" for x in _content(0, True)) == 2
+    assert "LEFT ARM" in _content(0, True)[-1]["text"]
+    assert sum(x["type"] == "image" for x in _content(0, False)) == 1
+    img = Image.new("RGB", (200, 160))
+    img.paste((255, 0, 0), (100, 0, 200, 160))  # casualty's LEFT side is the image right
+    crops = vlm_crops(img, _fake_kps(), 32)
+    assert len(crops) == 4
+    m = mirror_view_crops([crops])[0]
+    import numpy as np
+
+    for s in range(4):  # mirrored view's site s = original site perm[s], mirrored
+        assert np.array_equal(np.asarray(m[s]), np.asarray(crops[FLIP_PERMUTATION[s]])[:, ::-1])
+
+
+def test_vlm_prompt_token_order():
+    torch = pytest.importorskip("torch")
+    from d2qual.vlm_ft import VLMClassifier
+
+    full = torch.arange(2 * 3 * 1, dtype=torch.float32).view(2, 3, 1)       # N=2 photos, 3 tokens
+    crop = 100 + torch.arange(2 * 4 * 3 * 1, dtype=torch.float32).view(2, 4, 3, 1)
+    x = VLMClassifier._per_prompt(full, crop).view(2, 4, 6)
+    assert torch.equal(x[1, 2, :3], full[1, :, 0]) and torch.equal(x[1, 2, 3:], crop[1, 2, :, 0])
+    assert VLMClassifier._per_prompt(full).shape == (2 * 4 * 3, 1)
+
+
+def test_class_prior_ignores_masked_labels():
+    from d2qual.data import class_prior
+
+    assert class_prior({"a": ["wound", None, "no_injury", None],
+                        "b": ["wound", "amputation", None, None]})[:3] == ["wound", "amputation", "no_injury"]

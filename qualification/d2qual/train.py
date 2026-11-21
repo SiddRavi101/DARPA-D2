@@ -168,8 +168,9 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
     if args.backbone.startswith("vlm:"):  # fine-tuned vision-language candidate (d2qual/vlm_ft.py)
         from .vlm_ft import train_vlm
 
-        fallback = class_prior({i: labels[i] for i in train_ids})
-        return train_vlm(args, train_ids, val_ids, labels, out_path.parent / f"vlm_{out_path.stem}", device, fallback)
+        fallback = class_prior({i: labels[i] for i in train_ids if i not in getattr(args, "image_root_of", {})})
+        return train_vlm(args, train_ids, val_ids, labels, out_path.parent / f"vlm_{out_path.stem}", device, fallback,
+                         keypoints)
     cfg = ModelConfig(backbone=args.backbone, image_size=args.size,
                       limb_crops=keypoints is not None, crop_size=args.crop_size)
     model = InjuryNet(cfg, pretrained=not args.no_pretrained).to(device)
@@ -178,7 +179,7 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
     cfg.std = tuple(data_cfg.get("std", cfg.std))
 
     tr = InjuryDataset(args.images, labels, train_ids, cfg.image_size, True, cfg.mean, cfg.std, args.seed,
-                       keypoints=keypoints, crop_size=cfg.crop_size)
+                       keypoints=keypoints, crop_size=cfg.crop_size, roots=getattr(args, "image_root_of", None))
     va = InjuryDataset(args.images, labels, val_ids, cfg.image_size, False, cfg.mean, cfg.std,
                        keypoints=keypoints, crop_size=cfg.crop_size)
     tl = DataLoader(tr, batch_size=args.batch, shuffle=True, num_workers=args.workers,
@@ -202,7 +203,7 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
     crit = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     best = {"overall_accuracy": -1.0}
-    fallback = class_prior({i: labels[i] for i in train_ids})
+    fallback = class_prior({i: labels[i] for i in train_ids if i not in getattr(args, "image_root_of", {})})
     for epoch in range(args.epochs):
         model.train()
         if frozen:
@@ -242,6 +243,43 @@ def train_one(args, train_ids, val_ids, labels, out_path: Path, device, keypoint
     return best
 
 
+def _extra_kp_path(args, out: Path) -> Path:
+    base = Path(args.keypoints) if args.keypoints else out / "keypoints.json"
+    return base.with_name(base.stem + "_extra.json")
+
+
+def load_extra(args, out: Path, device):
+    """Extra training-only images (video frames). Each limb the pose model cannot find gets label None
+    (ignored by the loss): videos are not annotated for visibility, so an off-screen limb's label
+    says nothing about what the frame shows. -> (labels {id: [4 x class|None]}, {id: casualty})."""
+    if not args.extra_images:
+        return {}, {}
+    if args.folds > 1 and not (args.group_regex or args.groups_file):
+        raise SystemExit("--extra-images needs grouped CV (--groups-file): otherwise frames of a validation "
+                         "casualty would leak into training")
+    from .data import limb_boxes, load_label_groups
+    from .pose import build_cache
+
+    raw = match_images(args.extra_images, load_labels(args.extra_labels))
+    lg = load_label_groups(args.extra_labels) or {}
+    by_name = {Path(k).name.lower(): v for k, v in lg.items()}
+    groups = {i: by_name.get(i.lower()) for i in raw}
+    kps = build_cache(args.extra_images, list(raw), _extra_kp_path(args, out), device=device)
+    from PIL import Image
+
+    out_labels, masked = {}, 0
+    for i, lab in raw.items():
+        with Image.open(Path(args.extra_images) / i) as im:
+            size = im.size
+        _, feats = limb_boxes(kps[i], size)
+        new = [c if feats[s, 3] > 0 else None for s, c in enumerate(lab)]
+        masked += sum(c is None for c in new)
+        out_labels[i] = new
+    print(f"extra training images: {len(out_labels)} ({masked} of {4 * len(out_labels)} limb labels ignored: "
+          f"limb not found by pose); {sum(g is None for g in groups.values())} without a casualty id are dropped")
+    return {i: v for i, v in out_labels.items() if groups[i] is not None or args.folds <= 1}, groups
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--images", required=True, help="directory of training images (flat)")
@@ -274,6 +312,11 @@ def main(argv=None) -> None:
                     help="pose-guided limb crops (runs the pose model once and caches keypoints)")
     ap.add_argument("--crop-size", type=int, default=224)
     ap.add_argument("--vlm-size", type=int, default=448, help="square input size for vlm:<model> backbones")
+    ap.add_argument("--extra-images", default=None,
+                    help="extra TRAINING-only images, e.g. video frames from scripts/extract_video_frames.py")
+    ap.add_argument("--extra-labels", default=None,
+                    help="labels CSV for --extra-images, with a casualty_id column (frames of a validation "
+                         "casualty never enter that fold's training)")
     ap.add_argument("--keypoints", default=None,
                     help="keypoint cache JSON (default <out>/keypoints.json; built if missing)")
     args = ap.parse_args(argv)
@@ -298,9 +341,18 @@ def main(argv=None) -> None:
         found = [sum(float(keypoints[i][j, 2]) >= 0.35 for i in ids) / len(ids) for j in (9, 10, 15, 16)]
         print("limb crops: share of images with wrist/ankle found (L arm, R arm, L leg, R leg):",
               " ".join(f"{f:.2f}" for f in found))
+    extra, extra_groups = load_extra(args, out, device)
+    if extra:
+        labels = {**labels, **extra}
+        args.image_root_of = {i: args.extra_images for i in extra}
+        if keypoints is not None:
+            from .pose import build_cache
+
+            keypoints = {**keypoints, **build_cache(args.extra_images, list(extra), _extra_kp_path(args, out),
+                                                    device=device)}
     results = {}
     if args.folds <= 1:
-        results["full"] = train_one(args, ids, [], labels, out / "full.pt", device, keypoints)
+        results["full"] = train_one(args, ids + list(extra), [], labels, out / "full.pt", device, keypoints)
     else:
         groups = load_groups(ids, args.group_regex, args.groups_file)
         if groups:
@@ -319,6 +371,9 @@ def main(argv=None) -> None:
                 continue
             val = folds[i]
             trn = [x for j, f in enumerate(folds) if j != i for x in f]
+            if extra:  # frames only from casualties that are NOT in this fold's validation set
+                val_groups = {groups[v] for v in val}
+                trn += [e for e in extra if extra_groups.get(e) is not None and extra_groups[e] not in val_groups]
             print(f"-- fold {i} ({len(trn)} train / {len(val)} val)")
             results[f"fold{i}"] = train_one(args, trn, val, labels, out / f"fold{i}.pt", device, keypoints)
         accs = [r["overall_accuracy"] for r in results.values() if r.get("overall_accuracy") is not None]

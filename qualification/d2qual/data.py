@@ -202,7 +202,8 @@ def class_prior(labels: dict[str, list[str]]) -> list[str]:
     for s in range(4):
         counts = {c: 0 for c in CLASSES}
         for v in labels.values():
-            counts[v[s]] += 1
+            if v[s] in counts:  # None = unknown (masked video-frame limb)
+                counts[v[s]] += 1
         out.append(max(CLASSES, key=lambda c: counts[c]))
     return out
 
@@ -348,17 +349,21 @@ def crop_box(img: Image.Image, box, size: int, rng: Optional[random.Random] = No
     return img.crop((round(x0), round(y0), round(x1), round(y1))).resize((size, size), Image.BICUBIC)
 
 
-def limb_crops(img: Image.Image, kps, size: int, rng: Optional[random.Random] = None):
-    """-> (list of 4 PIL crops in SITES order, (4, N_KP_FEATS) features)."""
+def limb_crops(img: Image.Image, kps, size: int, rng: Optional[random.Random] = None, canonical: bool = True):
+    """-> (list of 4 PIL crops in SITES order, (4, N_KP_FEATS) features).
+
+    canonical=True (CNN heads): left-limb crops are mirrored to look like right limbs.
+    canonical=False (VLM): crops keep the photo's orientation, the question names the side."""
     import numpy as np
 
     if kps is None:
         kps = np.zeros((17, 3), np.float32)
     boxes, feats = limb_boxes(kps, img.size)
     crops = [crop_box(img, b, size, rng) for b in boxes]
-    # Canonical orientation: left-limb crops are mirrored to look like right limbs, so the shared
-    # classifier only learns "arm" / "leg"; laterality comes from pose, not the classifier.
-    crops = [ImageOps.mirror(c) if s in LEFT_SITES else c for s, c in enumerate(crops)]
+    if canonical:
+        # Canonical orientation: left-limb crops are mirrored to look like right limbs, so the shared
+        # classifier only learns "arm" / "leg"; laterality comes from pose, not the classifier.
+        crops = [ImageOps.mirror(c) if s in LEFT_SITES else c for s, c in enumerate(crops)]
     return crops, feats
 
 
@@ -386,8 +391,9 @@ class InjuryDataset:
 
     def __init__(self, image_dir, labels: dict[str, list[str]], image_ids: list[str],
                  size: int, train: bool, mean, std, seed: int = 0,
-                 keypoints: Optional[dict] = None, crop_size: int = 224):
+                 keypoints: Optional[dict] = None, crop_size: int = 224, roots: Optional[dict] = None):
         self.image_dir = Path(image_dir)
+        self.roots = roots or {}  # image id -> folder, for extra (video-frame) images
         self.labels = labels
         self.ids = image_ids
         self.size = size
@@ -404,7 +410,7 @@ class InjuryDataset:
         import torch
 
         iid = self.ids[i]
-        orig = load_image(self.image_dir / iid)
+        orig = load_image(Path(self.roots.get(iid, self.image_dir)) / iid)
         lab = list(self.labels[iid])
         crops = feats = None
         if self.keypoints is not None:
@@ -421,7 +427,7 @@ class InjuryDataset:
                 if crops is not None:
                     crops, feats = mirror_limb_inputs(crops, feats)
         x = to_tensor(letterbox(img, self.size), self.mean, self.std)
-        y = torch.tensor([CLASS_TO_IDX[c] for c in lab], dtype=torch.long)
+        y = torch.tensor([CLASS_TO_IDX.get(c, -100) for c in lab], dtype=torch.long)  # None -> ignored
         if crops is None:
             return x, y
         c = torch.stack([to_tensor(cr, self.mean, self.std) for cr in crops])

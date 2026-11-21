@@ -38,6 +38,12 @@ from .schema import CLASSES, FLIP_PERMUTATION
 
 log = logging.getLogger("d2qual")
 
+
+def torch_cat(xs, dim):
+    import torch
+
+    return torch.cat(xs, dim)
+
 DEFAULT_BASE = "Qwen/Qwen2-VL-2B-Instruct"
 META = "vlm_meta.json"
 FORMAT = "d2qual-vlm-v1"
@@ -52,12 +58,36 @@ QUESTION = (
     "D) not visible in the photo\n"
     "Answer with one letter."
 )
+CROP_INTRO = ("Second image: an automatic close-up of the casualty's {site}, cut out by a pose detector "
+              "(it can be off-target, or plain grey when the limb was not found).")
 LORA_TARGETS = r".*\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"  # LLM only, not the vision tower
 
 
 def _question(site: int) -> str:
     text = SITE_TEXT[site]
     return QUESTION.format(site=text, side=text.split()[0].lower())
+
+
+def _content(site: int, crops: bool) -> list:
+    """Chat content for one limb question: whole photo [+ that limb's close-up] + question."""
+    if not crops:
+        return [{"type": "image"}, {"type": "text", "text": _question(site)}]
+    return [{"type": "image"}, {"type": "image"},
+            {"type": "text", "text": CROP_INTRO.format(site=SITE_TEXT[site]) + "\n" + _question(site)}]
+
+
+def vlm_crops(img, kps, size: int, rng=None) -> list:
+    """4 limb close-ups for the VLM, in the photo's own orientation (the question names the side)."""
+    from .data import limb_crops
+
+    return limb_crops(img, kps, size, rng, canonical=False)[0]
+
+
+def mirror_view_crops(crops: list) -> list:
+    """Crops for the mirrored photo: the mirrored casualty's LEFT arm is the original right arm, mirrored."""
+    from PIL import ImageOps
+
+    return [[ImageOps.mirror(four[i]) for i in FLIP_PERMUTATION] for four in crops]
 
 
 class VLMClassifier:
@@ -83,9 +113,9 @@ class VLMClassifier:
         ids = [tok.encode(L, add_special_tokens=False) for L in LETTERS]
         assert all(len(i) == 1 for i in ids), f"answer letters must be single tokens: {ids}"
         self.letter_ids = [i[0] for i in ids]
-        self.prompts = [self.processor.apply_chat_template(
-            [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": _question(s)}]}],
-            tokenize=False, add_generation_prompt=True) for s in range(4)]
+        self.prompts = {c: [self.processor.apply_chat_template(
+            [{"role": "user", "content": _content(s, c)}], tokenize=False, add_generation_prompt=True)
+            for s in range(4)] for c in (False, True)}
         if not train:
             self.model.eval()
 
@@ -110,61 +140,89 @@ class VLMClassifier:
             return core, inner.visual, inner.language_model, inner.get_rope_index
         return core, core.visual, inner, core.get_rope_index  # transformers 4.51 Qwen2-VL
 
-    def _text_template(self):
-        """Tokenized 4 prompts with the image placeholder already expanded (fixed image size)."""
+    def _text_template(self, crops: bool = False):
+        """Tokenized 4 prompts with the image placeholders already expanded (fixed image size)."""
         if not hasattr(self, "_tmpl"):
+            self._tmpl = {}
+        if crops not in self._tmpl:
             from PIL import Image
 
             dummy = Image.new("RGB", (self.image_size, self.image_size))
-            enc = self.processor(text=list(self.prompts), images=[dummy] * 4, padding=True, return_tensors="pt")
-            self._tmpl = (enc["input_ids"], enc["attention_mask"], enc["image_grid_thw"][:1])
-        return self._tmpl
+            per = 2 if crops else 1
+            enc = self.processor(text=list(self.prompts[crops]), images=[dummy] * (4 * per), padding=True,
+                                 return_tensors="pt")
+            self._tmpl[crops] = (enc["input_ids"], enc["attention_mask"], enc["image_grid_thw"][:per])
+        return self._tmpl[crops]
 
-    def encode(self, images):
-        """Vision tower once per photo -> dict reusable across questions, adapters (no LoRA in vision)."""
-        from .data import letterbox
-
+    def _vision(self, ims):
+        """Square PIL images -> (embeds (N, T, d), deepstack list of (N, T, d) or None), one image per call."""
         torch = self.torch
         _, visual, _, _ = self._parts()
-        sq = [letterbox(im, self.image_size) for im in images]
-        pix = self.processor.image_processor(images=sq, return_tensors="pt")
+        pix = self.processor.image_processor(images=ims, return_tensors="pt")
         thw = pix["image_grid_thw"].to(self.device)
         pv = pix["pixel_values"].to(self.device, next(visual.parameters()).dtype)
         per = int(thw[0].prod())
         embs, deep = [], []
         with torch.no_grad():  # vision tower is frozen (LoRA only targets the LLM)
-            for i in range(len(sq)):
+            for i in range(len(ims)):
                 out = visual(pv[i * per:(i + 1) * per], grid_thw=thw[i:i + 1])
                 if isinstance(out, tuple):  # Qwen3-VL: (embeds, deepstack features per injection layer)
                     out, ds = out
                     deep.append(ds)
                 embs.append(out)
-        emb = torch.stack(embs)                                    # (N, tokens, d)
-        enc = {"n": len(sq), "image_embeds": emb, "thw": thw}
-        if deep:
-            enc["deepstack"] = [torch.stack([d[k] for d in deep]) for k in range(len(deep[0]))]
+        ds = [torch.stack([d[k] for d in deep]) for k in range(len(deep[0]))] if deep else None
+        return torch.stack(embs), ds
+
+    def encode(self, images, crops=None):
+        """Vision tower once per photo (and per limb close-up) -> dict reusable across questions and
+        adapters (no LoRA in vision). crops: optional list (per photo) of 4 PIL close-ups."""
+        from .data import letterbox
+
+        sq = [letterbox(im, self.image_size) for im in images]
+        emb, ds = self._vision(sq)
+        enc = {"n": len(sq), "image_embeds": emb}
+        if ds is not None:
+            enc["deepstack"] = ds
+        if crops is not None:
+            flat = [letterbox(c, self.image_size) for four in crops for c in four]
+            cemb, cds = self._vision(flat)
+            enc["crop_embeds"] = cemb.view(len(sq), 4, *cemb.shape[1:])
+            if cds is not None:
+                enc["crop_deepstack"] = [x.view(len(sq), 4, *x.shape[1:]) for x in cds]
         return enc
 
-    def logits_from(self, enc):
-        """-> tensor (N, 4 sites, 4 classes) of answer-letter logits."""
+    @staticmethod
+    def _per_prompt(full, crop=None):
+        """(N, T, d) [+ (N, 4, T, d)] -> (N*4*tokens, d) in prompt order: photo tokens then crop tokens."""
+        n, t, d = full.shape
+        x = full[:, None].expand(n, 4, t, d)
+        if crop is not None:
+            x = torch_cat([x, crop.to(full.dtype)], 2)
+        return x.reshape(-1, d)
+
+    def logits_from(self, enc, crops: bool = False):
+        """-> tensor (N, 4 sites, 4 classes) of answer-letter logits. crops=True uses the
+        photo + limb close-up prompts (needs encode(..., crops=...))."""
         torch = self.torch
         core, _, lm, rope = self._parts()
-        ids, mask, thw1 = self._text_template()
+        crops = bool(crops and "crop_embeds" in enc)
+        ids, mask, thw_p = self._text_template(crops)
         n = enc["n"]
         input_ids = ids.repeat(n, 1).to(self.device)            # image-major: 4 questions per image
         attn = mask.repeat(n, 1).to(self.device)
-        thw = thw1.to(self.device).repeat(4 * n, 1)
+        thw = thw_p.to(self.device).repeat(4 * n, 1)
         tok = lm.embed_tokens(input_ids)
         d = tok.shape[-1]
-        img = enc["image_embeds"].to(tok.dtype).repeat_interleave(4, dim=0).reshape(-1, d)
+        img = self._per_prompt(enc["image_embeds"].to(tok.dtype), enc["crop_embeds"] if crops else None)
         is_img = input_ids == core.config.image_token_id
         tok = tok.masked_scatter(is_img.unsqueeze(-1).expand_as(tok), img)
         pos, _ = rope(input_ids, thw, None, attn)
         extra = {}
         if "deepstack" in enc:  # Qwen3-VL adds multi-level vision features inside early decoder layers
+            cds = enc.get("crop_deepstack") if crops else None
             extra = {"visual_pos_masks": is_img,
-                     "deepstack_visual_embeds": [x.to(tok.dtype).repeat_interleave(4, dim=0).reshape(-1, d)
-                                                 for x in enc["deepstack"]]}
+                     "deepstack_visual_embeds": [self._per_prompt(x.to(tok.dtype), cds[k] if cds else None)
+                                                 for k, x in enumerate(enc["deepstack"])]}
         cache_pos = torch.arange(input_ids.shape[1], device=self.device)
         hidden = lm(input_ids=None, attention_mask=attn, position_ids=pos, inputs_embeds=tok, use_cache=False,
                     cache_position=cache_pos, **extra).last_hidden_state[:, -1]
@@ -172,48 +230,49 @@ class VLMClassifier:
         logits = (hidden.to(w.dtype) @ w.T).float()
         return logits.view(n, 4, len(LETTERS))
 
-    def letter_logits(self, images):
-        return self.logits_from(self.encode(images))
+    def letter_logits(self, images, crops=None):
+        return self.logits_from(self.encode(images, crops), crops is not None)
 
     def letter_logits_reference(self, images):
         """Original slow path, kept only to check the fast path gives the same numbers."""
         from .data import letterbox
 
         sq = [letterbox(im, self.image_size) for im in images]
-        texts = [p for _ in sq for p in self.prompts]
+        texts = [p for _ in sq for p in self.prompts[False]]
         ims = [im for im in sq for _ in range(4)]
         enc = {k: v.to(self.device) for k, v in self.processor(text=texts, images=ims, padding=True,
                                                                return_tensors="pt").items()}
         out = self.model(**enc, use_cache=False)
         return out.logits[:, -1, :][:, self.letter_ids].float().view(len(images), 4, len(LETTERS))
 
-    def encode_views(self, images, tta: bool = True):
+    def encode_views(self, images, tta: bool = True, crops=None):
         from PIL import ImageOps
 
-        views = [self.encode(images)]
+        views = [self.encode(images, crops)]
         if tta:
-            views.append(self.encode([ImageOps.mirror(im) for im in images]))
+            views.append(self.encode([ImageOps.mirror(im) for im in images],
+                                     mirror_view_crops(crops) if crops is not None else None))
         return views
 
-    def probs_from(self, views):
-        p = self.logits_from(views[0]).softmax(-1)
+    def probs_from(self, views, crops: bool = False):
+        p = self.logits_from(views[0], crops).softmax(-1)
         if len(views) > 1:
-            pm = self.logits_from(views[1]).softmax(-1)
+            pm = self.logits_from(views[1], crops).softmax(-1)
             p = (p + pm[:, list(FLIP_PERMUTATION)]) / 2
         return p
 
-    def predict_probs(self, images, tta: bool = True):
+    def predict_probs(self, images, tta: bool = True, crops=None):
         with self.torch.inference_mode():
-            return self.probs_from(self.encode_views(images, tta))
+            return self.probs_from(self.encode_views(images, tta, crops), crops is not None)
 
 
 # ── training (one fold) ─────────────────────────────────────────────────────────
 
-def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback) -> dict:
+def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback, keypoints=None) -> dict:
     import torch
     from peft import LoraConfig, get_peft_model
 
-    from .data import CLASS_TO_IDX, _augment, flip_labels, load_image
+    from .data import CLASS_TO_IDX, _augment, _augment_crop, flip_labels, load_image
 
     base = args.backbone.split(":", 1)[1] or DEFAULT_BASE
     clf = VLMClassifier(base, device, image_size=args.vlm_size, train=True)
@@ -236,21 +295,31 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback)
     warm = max(1, int(0.05 * steps))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps))))
-    crit = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    crit = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)  # ignore_index -100 = unknown label
+    use_crops = keypoints is not None
+    image_root = getattr(args, "image_root_of", {})  # extra (video-frame) ids live in another folder
     cache: dict = {}
 
-    def get(iid):  # decode once, keep a downsized copy (VLM sees 448 px anyway)
+    def get(iid):
+        """decode once; keep a downsized photo (VLM sees 448 px anyway) and, in crop mode, the 4
+        limb close-ups cut from the FULL-resolution photo (that is where the wound detail is)."""
         if iid not in cache:
-            im = load_image(Path(args.images) / iid)
+            im = load_image(Path(image_root.get(iid, args.images)) / iid)
+            crops = vlm_crops(im, keypoints.get(iid), args.vlm_size) if use_crops else None
             s = min(1.0, 2 * args.vlm_size / max(im.size))
-            cache[iid] = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s)))) if s < 1 else im
+            small = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s)))) if s < 1 else im
+            cache[iid] = (small, crops)
         return cache[iid]
+
+    def batch_crops(iids):
+        return [get(i)[1] for i in iids] if use_crops else None
 
     def evaluate():
         model.eval()
         probs = []
         for k in range(0, len(val_ids), args.batch):
-            probs.append(clf.predict_probs([get(i) for i in val_ids[k:k + args.batch]]).cpu())
+            chunk = val_ids[k:k + args.batch]
+            probs.append(clf.predict_probs([get(i)[0] for i in chunk], crops=batch_crops(chunk)).cpu())
         model.train()
         probs = torch.cat(probs) if probs else torch.zeros(0, 4, 4)
         y = torch.tensor([[CLASS_TO_IDX[c] for c in labels[i]] for i in val_ids])
@@ -268,17 +337,23 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback)
         rng.shuffle(order)
         t0, running, n = time.time(), 0.0, 0
         for k in range(0, len(order), args.batch):
-            ims, ys = [], []
+            ims, ys, crs = [], [], []
             for iid in order[k:k + args.batch]:
-                im, lab = _augment(get(iid), rng), list(labels[iid])
+                small, crops = get(iid)
+                im, lab = _augment(small, rng), list(labels[iid])
+                if crops is not None:
+                    crops = [_augment_crop(c, rng) for c in crops]
                 if rng.random() < 0.5:
                     from PIL import ImageOps
                     im, lab = ImageOps.mirror(im), flip_labels(lab)
+                    if crops is not None:
+                        crops = mirror_view_crops([crops])[0]
                 ims.append(im)
-                ys.append([CLASS_TO_IDX[c] for c in lab])
+                crs.append(crops)
+                ys.append([CLASS_TO_IDX.get(c, -100) for c in lab])  # None (unknown) -> ignored
             y = torch.tensor(ys, device=device).view(-1)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = clf.letter_logits(ims).view(-1, len(LETTERS))
+                logits = clf.letter_logits(ims, crs if use_crops else None).view(-1, len(LETTERS))
             loss = crit(logits.float(), y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -297,20 +372,21 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback)
                 best = {"overall_accuracy": acc, "epoch": epoch + 1,
                         "confusion": {"labels": list(CLASSES), "matrix": conf.tolist()},
                         "oof": {iid: pr.tolist() for iid, pr in zip(val_ids, probs)}}
-                _save(model, out_dir, base, args, fallback, acc)
+                _save(model, out_dir, base, args, fallback, acc, use_crops)
                 msg += " *"
         print(msg, flush=True)
     if not val_ids:
-        _save(model, out_dir, base, args, fallback, None)
+        _save(model, out_dir, base, args, fallback, None, use_crops)
         best = {"overall_accuracy": None, "epoch": args.epochs}
     return best
 
 
-def _save(model, out_dir: Path, base: str, args, fallback, acc):
+def _save(model, out_dir: Path, base: str, args, fallback, acc, limb_crops: bool = False):
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)  # adapter only (~tens of MB)
     (out_dir / META).write_text(json.dumps({
         "format": FORMAT, "base": base, "image_size": args.vlm_size, "classes": list(CLASSES),
+        "limb_crops": bool(limb_crops),
         "fallback": list(fallback), "metrics": {"overall_accuracy": acc},
         "data_source": getattr(args, "data_source", "unspecified")}, indent=1))
 
@@ -345,13 +421,14 @@ class _BaseGroup:
         pm = None
         for d in member_dirs:
             name = d.name.replace(".", "_")
+            crops = bool(json.loads((d / META).read_text()).get("limb_crops"))
             if pm is None:
                 pm = PeftModel.from_pretrained(self.clf.model, str(d), adapter_name=name)
             else:
                 pm.load_adapter(str(d), adapter_name=name)
-            self.names.append((name, d.name))
+            self.names.append((name, d.name, crops))
         self.clf.model = pm.eval()
-        log.info("vlm members %s on base %s", [n for _, n in self.names], path)
+        log.info("vlm members %s on base %s", [n for _, n, _ in self.names], path)
 
 
 class VLMEnsemble:
@@ -366,14 +443,20 @@ class VLMEnsemble:
                        for b, ds in groups.items()]
         self.fallback = metas[member_dirs[0]].get("fallback")
         self.tta = os.environ.get("D2_VLM_TTA", "1") != "0"
+        self.needs_pose = any(c for g in self.groups for _, _, c in g.names)
 
-    def member_probs(self, images):
-        """-> list of (member dir name, probs tensor (N,4,4)) one per adapter."""
+    def member_probs(self, images, keypoints=None):
+        """-> list of (member dir name, probs tensor (N,4,4)) one per adapter.
+        keypoints (per image, or None) feed the limb close-ups of crop-mode adapters."""
         out = []
         for g in self.groups:
+            crops = None
+            if any(c for _, _, c in g.names):
+                kps = keypoints or [None] * len(images)
+                crops = [vlm_crops(im, kp, g.clf.image_size) for im, kp in zip(images, kps)]
             with g.clf.torch.inference_mode():
-                views = g.clf.encode_views(images, self.tta)  # vision once, shared by every adapter
-                for adapter, dname in g.names:
+                views = g.clf.encode_views(images, self.tta, crops)  # vision once, shared by every adapter
+                for adapter, dname, use_crops in g.names:
                     g.clf.model.set_adapter(adapter)
-                    out.append((dname, g.clf.probs_from(views)))
+                    out.append((dname, g.clf.probs_from(views, use_crops)))
         return out

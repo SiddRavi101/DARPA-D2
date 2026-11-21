@@ -52,7 +52,9 @@ class Ensemble:
         self.vlm = None
         weights_dir = Path(weights_dir)
         wfile = weights_dir / "ensemble.json"
-        self.weights = json.loads(wfile.read_text())["weights"] if wfile.exists() else None
+        edoc = json.loads(wfile.read_text()) if wfile.exists() else {}
+        self.weights = edoc.get("weights")
+        self.stacker = edoc.get("stacker")  # per-label combiner over candidates (d2qual/stack.py)
         for p in sorted(weights_dir.glob("*.pt")):
             if self.weights is not None and self.weights.get(p.name, 0) <= 0:
                 continue
@@ -79,7 +81,7 @@ class Ensemble:
                         self.fallback = list(self.vlm.fallback)
                 except Exception as e:
                     log.exception("VLM members failed to load (%s); continuing without them", e)
-        if any(m.cfg.limb_crops for _, m in self.members):
+        if any(m.cfg.limb_crops for _, m in self.members) or (self.vlm is not None and self.vlm.needs_pose):
             from .pose import PoseExtractor
 
             self.pose = PoseExtractor.try_load(weights_dir, device)
@@ -100,7 +102,7 @@ class Ensemble:
         torch = self.torch
         half = self.device.type == "cuda"
         keypoints = None
-        if any(m.cfg.limb_crops for _, m in self.members):
+        if any(m.cfg.limb_crops for _, m in self.members) or (self.vlm is not None and self.vlm.needs_pose):
             keypoints = [None] * len(images)
             if self.pose is not None:
                 try:
@@ -108,6 +110,7 @@ class Ensemble:
                 except Exception as e:  # pose failure must not kill the batch
                     log.error("pose extraction failed (%s); using blank limb crops", e)
         total, wsum = None, 0.0
+        per_member = {}  # member name -> (N,4,4) probs, for the stacker
         for name, model in self.members:
             cfg = model.cfg
             x = torch.stack([to_tensor(letterbox(im, cfg.image_size), cfg.mean, cfg.std) for im in images])
@@ -123,21 +126,98 @@ class Ensemble:
             with torch.inference_mode():
                 p = model(x, crops, kpf).float().softmax(-1)
                 p = (p + flip_logits(model(*mirror_inputs(x, crops, kpf)).float()).softmax(-1)) / 2
+            per_member[name] = p
             w = self._w(name)
             total = p * w if total is None else total + p * w
             wsum += w
         if self.vlm is not None:
             try:
-                for name, p in self.vlm.member_probs(images):
+                for name, p in self.vlm.member_probs(images, keypoints):
                     w = self._w(name)
                     p = p.to(total.device if total is not None else p.device).float()
+                    per_member[name] = p
                     total = p * w if total is None else total + p * w
                     wsum += w
             except Exception as e:  # keep the CNN result if the VLM fails mid-run
                 log.exception("VLM inference failed on a batch: %s", e)
         if total is None or wsum <= 0:
             raise RuntimeError("no ensemble member produced output")
+        stacked = self._stack(per_member)
+        if stacked is not None:
+            return stacked.tolist()
         return (total / wsum).cpu().tolist()
+
+    def embed(self, images):
+        """L2-normalised global features from the first whole-image CNN/ViT member (for pooling)."""
+        from .data import letterbox, to_tensor
+
+        torch = self.torch
+        name, model = next((n, m) for n, m in self.members if not m.cfg.limb_crops)
+        cfg = model.cfg
+        x = torch.stack([to_tensor(letterbox(im, cfg.image_size), cfg.mean, cfg.std) for im in images]).to(self.device)
+        if self.device.type == "cuda":
+            x = x.half()
+        with torch.inference_mode():
+            f = model.backbone(x).float()
+        return torch.nn.functional.normalize(f, dim=-1).cpu().numpy()
+
+    def _stack(self, per_member):
+        """Average each candidate's fold members, then apply the stacker. None if it can't run
+        (a candidate failed to load) -> caller uses the weighted average instead."""
+        if not self.stacker:
+            return None
+        import numpy as np
+
+        from .stack import apply
+
+        by_cand: dict = {}
+        for name, p in per_member.items():
+            by_cand.setdefault(name.split("__")[0], []).append(p.float().cpu().numpy())
+        try:
+            per = [np.mean(by_cand[c], 0) for c in self.stacker["candidates"]]
+        except KeyError as e:
+            log.error("stacker candidate %s missing; using weighted average", e)
+            return None
+        return apply(self.stacker, per)
+
+
+def cluster(emb, sim: float) -> list[int]:
+    """Average-linkage agglomerative clustering on cosine similarity; merge while the best pair of
+    clusters is at least `sim` similar. emb: (N, D) L2-normalised. -> cluster id per row."""
+    import numpy as np
+
+    emb = np.asarray(emb, np.float64)
+    s = emb @ emb.T
+    clusters = [[i] for i in range(len(emb))]
+    while len(clusters) > 1:
+        best, pair = -2.0, None
+        for a in range(len(clusters)):
+            for b in range(a + 1, len(clusters)):
+                v = s[np.ix_(clusters[a], clusters[b])].mean()
+                if v > best:
+                    best, pair = v, (a, b)
+        if best < sim:
+            break
+        a, b = pair
+        clusters[a] += clusters.pop(b)
+    out = [0] * len(emb)
+    for k, c in enumerate(clusters):
+        for i in c:
+            out[i] = k
+    return out
+
+
+def _pool_predictions(all_probs: dict, embeds: dict, labels: dict, sim: float, alpha: float) -> None:
+    import numpy as np
+
+    from .stack import pool_by_group
+
+    names = [n for n in embeds if n in all_probs]
+    groups = cluster(np.stack([embeds[n] for n in names]), sim)
+    pooled = pool_by_group(np.asarray([all_probs[n] for n in names]), groups, alpha)
+    for n, pr in zip(names, pooled):
+        labels[n] = [CLASSES[int(np.argmax(site))] for site in pr]
+    log.info("pooling: %d photos in %d clusters (sim %.2f, alpha %.2f)", len(names), len(set(groups)), sim, alpha)
 
 
 def _select_device():
@@ -182,6 +262,11 @@ def run(input_dir: str | Path, output_path: str | Path, weights_dir: str | Path,
 
     _flush()
 
+    # D2_POOL=1: share injury evidence across photos that look like the same casualty (off by default;
+    # only enable once DARPA confirms predictions may depend on other test images).
+    pool = os.environ.get("D2_POOL") == "1"
+    all_probs: dict = {}
+    embeds: dict = {}
     ensemble: Optional[Ensemble] = None
     vlm = None
     try:
@@ -214,6 +299,13 @@ def run(input_dir: str | Path, output_path: str | Path, weights_dir: str | Path,
                     probs = ensemble.predict_probs([im for _, im in ok])
                     for (p, _), pr in zip(ok, probs):
                         labels[p.name] = [CLASSES[max(range(4), key=site.__getitem__)] for site in pr]
+                        all_probs[p.name] = pr
+                    if pool:
+                        try:
+                            for (p, _), e in zip(ok, ensemble.embed([im for _, im in ok])):
+                                embeds[p.name] = e
+                        except Exception as e:
+                            log.error("embedding failed (%s); pooling skips this batch", e)
                 elif vlm is not None:
                     for p, im in ok:
                         labels[p.name] = vlm.classify(im) or fallback
@@ -232,6 +324,12 @@ def run(input_dir: str | Path, output_path: str | Path, weights_dir: str | Path,
                 log.info("%d/%d done (%.0fs)", min(start + batch_size, len(images)), len(images),
                          time.monotonic() - t_start)
 
+    if pool and len(embeds) > 1:
+        try:
+            _pool_predictions(all_probs, embeds, labels, float(os.environ.get("D2_POOL_SIM", "0.9")),
+                              float(os.environ.get("D2_POOL_ALPHA", "1.0")))
+        except Exception as e:  # pooling is an optional refinement; keep per-photo labels
+            log.exception("pooling failed: %s", e)
     doc = _flush()
     errs = validate_document(doc, [p.name for p in images])
     if errs:  # should be impossible; never leave an invalid file behind

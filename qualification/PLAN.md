@@ -56,6 +56,29 @@ For each manikin photo we label four limb sites as `no_injury`, `wound`, `amputa
    - `scripts/submit.sh` builds the image, runs a CPU smoke test and the validator, scans with ClamAV, pushes, and records the digest.
    - Then send the submission details to DARPA.
 
+## Push for 0.85+ (round 2, built 2026-11-21, not yet run on DARPA data)
+
+These additions target what a plain ensemble misses: small wounds, amputations and the label
+balance. All of them are scored by the same grouped out-of-fold run, so each one stays only if it
+raises the DARPA metric.
+
+| Addition | What it does | How to run |
+|---|---|---|
+| **VLM + limb close-ups** (`vlm_qwen3vl_2b_crops`, `vlm_qwen3vl_4b_crops`) | Each limb question shows the whole photo **and** a full-resolution crop of that limb found by the pose model. Small wounds survive the 448 px input. | Add the candidates to `--candidates`. About 3× the plain VLM's vision cost; it still fits the hour. |
+| **Per-label stacker** (`d2qual/stack.py`) | A small logistic regression over every candidate's class probabilities learns whom to trust for each label. It is scored with nested grouped CV, used only if it beats the greedy ensemble by more than 0.003, and applied automatically in the container. | `leaderboard` runs it when given `--groups-file`. |
+| **Video frames** (`scripts/extract_video_frames.py`) | 4 frames per video, about 940 extra training images. A limb the pose model can't find is ignored by the loss, because videos carry no `not_testable` labels. Frames of a validation casualty never enter that fold's training, and CV stays photo-only. | `extract_video_frames.py --csv ... --root ... --out work/frames`, then `bakeoff.py run ... --extra-images work/frames/images --extra-labels work/frames/labels.csv`. |
+| **Casualty pooling** (off by default) | A casualty's injuries don't change between photos; visibility does. Injury evidence is shared across photos of the same casualty while each photo keeps its own `not_testable`. The leaderboard reports the upper bound with the true casualty ids. | Ask DARPA first. Tune the threshold with `scripts/tune_pool.py`, then set `D2_POOL=1` and `D2_POOL_SIM` in the container. |
+| **Final retrain** | Every chosen candidate is retrained on all photos (+ frames) with 3 seeds, keeping the same weights and stacker. | `bakeoff.py final --images I --labels L --runs runs --out model/weights [--extra-images ...]` |
+
+**Order:**
+1. Round 1 bake-off.
+2. Error review.
+3. Round 2: the crop VLMs plus frames on the top candidates, with the stacker.
+4. Final retrain.
+5. Re-time the container.
+6. Blind test.
+7. Submit.
+
 ## Blind test: Mannequin In-Bed
 
 This is an outside check that the locked ensemble works on a **manikin** it has never seen: lying down, in different lighting, from a different camera. It exists to catch failures that DARPA-only cross-validation can't, such as left/right swaps on a lying body or a model that only works on DARPA's camera setup.
@@ -170,6 +193,7 @@ Training runs on Runpod Secure Cloud A40s (48 GB, $0.59/hr). That's the card our
 - [ ] May we use public datasets (COCO, the Mannequin In-Bed manikin set) to select and sanity-check models? Rules §6 bars "any other human subject data".
 - [ ] Do submission details go by email (ICD v1.1) or through a Submission Portal (v1.0)?
 - [ ] Is `not_testable` valid in the v1.1 schema appendix? The v1.0 appendix omits it.
+- [ ] May a prediction for one test image use the other test images (e.g. pooling evidence across photos of the same casualty), or must each image be predicted independently?
 
 ## Data handling
 

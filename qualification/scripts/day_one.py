@@ -153,7 +153,7 @@ def cmd_run(a) -> None:
             "--folds", str(a.folds), "--epochs", str(a.epochs), *grp, "--", "--data-source", "darpa"]
     if _sh(bake) != 0:
         raise SystemExit("bake-off failed; see runs/<candidate>/train.log")
-    _sh([py, "scripts/bakeoff.py", "leaderboard", *common, "--runs", str(runs)])
+    _sh([py, "scripts/bakeoff.py", "leaderboard", *common, "--runs", str(runs), *grp])
     _sh([py, "scripts/bakeoff.py", "assemble", "--runs", str(runs), "--out", str(weights)])
 
     # Timing: run the assembled ensemble offline on a sample, project to the test-set size.

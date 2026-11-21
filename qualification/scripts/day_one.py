@@ -35,7 +35,7 @@ from d2qual.schema import CLASSES, SITE_KEYS  # noqa: E402
 
 DEFAULT_CANDIDATES = (
     # fast first, so leaderboard rows arrive early; VLMs (slowest) last
-    "eva02_b,siglip_b,"  # COCO re-test 2026-11-20 (PLAN.md)
+    "eva02_b,siglip_b,convnext_b,"  # COCO re-test 2026-11-20 (PLAN.md); ConvNeXt-B = CNN for ensemble diversity
     "dinov2_l_reg_probe,dinov2_b_reg_limb_probe,dinov2_l_reg_limb_probe,"  # Rohan's approaches A and B
     "vlm_qwen3vl_2b,vlm_qwen3vl_4b"
 )

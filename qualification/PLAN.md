@@ -109,6 +109,7 @@ Scores are from the Nov 20 COCO re-test, where every fold keeps its final epoch.
   Round 1 runs `dinov2_l_reg_probe` (A), `dinov2_b_reg_limb_probe` and `dinov2_l_reg_limb_probe` (B). `dinov2_b_reg_probe` is available but not in the default run.
   - **Watch:** Approach B takes left/right from the pose model (Keypoint R-CNN). Our Nov 18 checks found front/back confusion on synthetic casualties. A prone/supine flip would swap both sides of a crop, so check B's left/right swap count in the error review against the whole-image models.
   - **Compliance:** Shravan's v2 plan listed DINOv2 and COCO-trained pose models as "not until DARPA OKs". Using them is now a team decision, and it stays on the DARPA question list below.
+- **ConvNeXt-B** (`convnext_b`, fully fine-tuned) is in the default bake-off: the only CNN, added for ensemble diversity and fine wound texture (also in Rohan's plan). The ensemble drops it if it does not help.
 - **Backup:** Qwen2-VL-2B (`vlm_qwen2vl_2b`, 0.887) and ConvNeXt-S (`convnext_s`, 0.860).
 - **Dropped:** SigLIP 2-B (0.801; would need its own learning rate) and fully fine-tuned DINOv2-B (0.770). Rohan's frozen DINOv2-with-registers probes are a different setup and stay in.
 - **On hold:** pose-guided limb crops (`convnext_s_limb`, 0.827). Retest only if errors show that wounds need close-up detail, or that left/right is the main error.

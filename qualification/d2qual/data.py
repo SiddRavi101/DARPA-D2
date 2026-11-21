@@ -95,10 +95,15 @@ def _from_csv(path: Path) -> dict[str, list[str]]:
     if not rows:
         return {}
     cols = {_norm(c): c for c in rows[0].keys()}
-    id_col = next((cols[c] for c in ("image_id", "image", "filename", "file", "file_name", "img")
+    id_col = next((cols[c] for c in ("image_id", "image", "filename", "file", "file_name", "img",
+                                     "filepath", "file_path", "path", "image_path")
                    if c in cols), None)
     if id_col is None:
         raise ValueError(f"{path}: no image id column in {list(rows[0].keys())}")
+    # DARPA's train_dataset.csv mixes image and video rows (media_format): keep images only,
+    # so a video sharing a stem with a photo can never overwrite the photo's labels.
+    if "media_format" in cols:
+        rows = [r for r in rows if _norm(r[cols["media_format"]]) in ("image", "")]
 
     # Long format: one row per (image, site)
     if {"body_region", "laterality", "injury_type"} <= set(cols):
@@ -122,6 +127,29 @@ def _from_csv(path: Path) -> dict[str, list[str]]:
     return {
         r[id_col]: [normalize_class(r[site_cols[k]]) for k in SITE_KEYS] for r in rows
     }
+
+
+GROUP_COLUMNS = ("casualty_id", "subject_id", "manikin_id", "patient_id", "scene_id", "session_id")
+
+
+def load_label_groups(path: str | Path) -> dict[str, str] | None:
+    """image id -> group from a label CSV that carries a casualty/subject id column, else None."""
+    path = Path(path)
+    if path.suffix.lower() != ".csv":
+        return None
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return None
+    cols = {_norm(c): c for c in rows[0].keys()}
+    gcol = next((cols[c] for c in GROUP_COLUMNS if c in cols), None)
+    id_col = next((cols[c] for c in ("image_id", "image", "filename", "file", "file_name", "img",
+                                     "filepath", "file_path", "path", "image_path") if c in cols), None)
+    if gcol is None or id_col is None:
+        return None
+    if "media_format" in cols:
+        rows = [r for r in rows if _norm(r[cols["media_format"]]) in ("image", "")]
+    return {r[id_col]: str(r[gcol]) for r in rows}
 
 
 def load_labels(path: str | Path) -> dict[str, list[str]]:

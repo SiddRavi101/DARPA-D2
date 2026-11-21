@@ -453,3 +453,17 @@ def test_only_darpa_tagged_models_pass_provenance(image_dir, tmp_path):
     ap.add_argument("extra", nargs=argparse.REMAINDER)
     got = ap.parse_args(["--candidates", "x", "--", "--data-source", "darpa"]).extra
     assert [t for t in got if t != "--"] == ["--data-source", "darpa"]
+
+
+def test_darpa_style_csv_skips_videos_and_yields_groups(tmp_path):
+    from d2qual.data import load_label_groups
+
+    p = tmp_path / "train_dataset.csv"
+    p.write_text("casualty_id,filepath,media_format,arm_left,arm_right,leg_left,leg_right\n"
+                 "c1,images/a.jpg,image,no_injury,wound,amputation,not_testable\n"
+                 "c1,videos/a.mp4,video,wound,wound,wound,wound\n"
+                 "c2,images/b.png,image,no_injury,no_injury,no_injury,no_injury\n")
+    lab = load_labels(p)
+    assert set(lab) == {"images/a.jpg", "images/b.png"}
+    assert lab["images/a.jpg"] == ["no_injury", "wound", "amputation", "not_testable"]
+    assert load_label_groups(p) == {"images/a.jpg": "c1", "images/b.png": "c2"}

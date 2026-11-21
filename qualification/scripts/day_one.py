@@ -30,7 +30,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from d2qual.data import load_labels, match_images  # noqa: E402
+from d2qual.data import load_label_groups, load_labels, match_images  # noqa: E402
 from d2qual.schema import CLASSES, SITE_KEYS  # noqa: E402
 
 DEFAULT_CANDIDATES = "vlm_qwen3vl_2b,vlm_qwen3vl_4b,eva02_b,siglip_b"  # COCO re-test 2026-11-20 (PLAN.md)
@@ -100,6 +100,16 @@ def cmd_inspect(a) -> None:
 
     props = propose_groupings(ids)
     lines += ["", "## Candidate groupings (pick one - or none - and pass it to `run`)", ""]
+    lg = load_label_groups(a.labels)
+    if lg:
+        on_disk = {Path(i).stem.lower(): i for i in ids}
+        gmap = {on_disk[Path(k).stem.lower()]: g for k, g in lg.items() if Path(k).stem.lower() in on_disk}
+        gfile = work / "groups.csv"
+        gfile.write_text("image_id,group" + chr(10) + "".join(f"{k},{v}" + chr(10) for k, v in sorted(gmap.items())), encoding="utf-8")
+        sizes = sorted(Counter(gmap.values()).values(), reverse=True)
+        lines += [f"- **Label file has a casualty/subject id column**: {len(set(gmap.values()))} groups for "
+                  f"{len(gmap)} images (median {sizes[len(sizes) // 2]} images/group, largest {sizes[:5]}). "
+                  f"Use `--groups-file {gfile}` (recommended over filename guesses).", ""]
     if not props:
         lines.append("No filename pattern groups the images. Ask DARPA / read the data README for "
                      "scene or manikin ids; otherwise use --no-groups and treat CV as optimistic.")

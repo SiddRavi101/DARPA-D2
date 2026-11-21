@@ -83,21 +83,24 @@ This is an outside check that the locked ensemble works on a **manikin** it has 
 
 ## Candidates
 
-All four run in the bake-off; the DARPA data decides what ships. Every candidate uses:
+The main four run in the bake-off; the DARPA data decides what ships. Every candidate uses:
 - mirror-flip augmentation and test-time augmentation that **swap the left/right labels** with the image;
 - letterboxing, never random crops, because a crop can cut a limb out of frame.
 
+Scores are from the Nov 20 COCO re-test, where every fold keeps its final epoch.
+
 | Candidate | `bakeoff.py` name | Type | COCO screen accuracy | Notes |
 |---|---|---|---|---|
-| Qwen2-VL-2B + LoRA | `vlm_qwen2vl_2b` | VLM (Apache-2.0) | 0.887 | One A/B/C/D question per limb, reading the letter scores. This follows PRONTO (UPenn), whose small fine-tuned VLM beat their other approaches. Slowest to train; 0.76 s per image at inference with 3 adapters and mirror TTA. |
-| EVA02-B | `eva02_b` | Image classifier | 0.877 | Best plain image model |
-| SigLIP-B | `siglip_b` | Image classifier | 0.870 | Fastest (3 min on COCO) |
-| ConvNeXt-S | `convnext_s` | Image classifier | 0.865 | Different architecture, for ensemble diversity |
+| Qwen3-VL-2B + LoRA | `vlm_qwen3vl_2b` | VLM (Apache-2.0) | 0.891 | **Main VLM.** One A/B/C/D question per limb, reading the letter scores; this follows PRONTO (UPenn), whose small fine-tuned VLM beat their other approaches. 37 min to train on COCO; 0.71 s per image with 3 adapters + mirror TTA; 6.7 GB peak. |
+| Qwen3-VL-4B + LoRA | `vlm_qwen3vl_4b` | VLM (Apache-2.0) | 0.894 | Best single model, within noise of the 2B. 1.37 s per image and 12.6 GB peak, so it fits only with TTA off or 1 adapter. |
+| EVA02-B | `eva02_b` | Image classifier | 0.870 | Best plain image model |
+| SigLIP-B | `siglip_b` | Image classifier | 0.869 | Fastest (2 min on COCO) |
 
-- **Dropped:** DINOv2-B (0.770).
-- **On hold:** pose-guided limb crops (`convnext_s_limb`, 0.827). Retest only if errors show that wounds need close-up detail.
-- The COCO ensemble reached 0.894.
-- COCO has no wound or amputation classes, so these numbers only screen candidates; they don't predict the DARPA score. See [coco_bakeoff](results/coco_bakeoff_2026-11-18.md).
+- **Backup:** Qwen2-VL-2B (`vlm_qwen2vl_2b`, 0.887) and ConvNeXt-S (`convnext_s`, 0.860).
+- **Dropped:** SigLIP 2-B (0.801; would need its own learning rate) and DINOv2-B (0.770).
+- **On hold:** pose-guided limb crops (`convnext_s_limb`, 0.827). Retest only if errors show that wounds need close-up detail, or that left/right is the main error.
+- The best COCO ensemble was half Qwen3-VL-4B, half Qwen3-VL-2B: 0.898. It needs about 69 min per 2,000 images with TTA, so TTA off or fewer adapters is required.
+- COCO has no wound or amputation classes, so these numbers only screen candidates; they don't predict the DARPA score. See [coco_retest](results/coco_retest_2026-11-20.md) and [coco_bakeoff](results/coco_bakeoff_2026-11-18.md).
 
 **What gets picked:**
 - **Accuracy** on the held-out (out-of-fold) predictions decides.

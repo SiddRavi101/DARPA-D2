@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT))
 from d2qual.data import load_labels, match_images  # noqa: E402
 from d2qual.schema import CLASSES, SITE_KEYS  # noqa: E402
 
-DEFAULT_CANDIDATES = "eva02_b,siglip_b,convnext_s,vlm_qwen2vl_2b"  # COCO-filter survivors (PLAN.md)
+DEFAULT_CANDIDATES = "vlm_qwen3vl_2b,vlm_qwen3vl_4b,eva02_b,siglip_b"  # COCO re-test 2026-11-20 (PLAN.md)
 BUDGET_S = 50 * 60  # predict.py's own wall-clock budget inside DARPA's 1 h
 
 # Candidate grouping patterns, most specific first. Each must leave >= 2 images per group on average.

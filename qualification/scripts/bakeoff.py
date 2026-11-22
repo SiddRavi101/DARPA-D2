@@ -62,6 +62,9 @@ CANDIDATES: dict[str, list[str]] = {
     # Qwen3-VL (Oct 2025, Apache-2.0): newer generation, needs transformers >= 4.57
     "vlm_qwen3vl_2b": ["--backbone", "vlm:Qwen/Qwen3-VL-2B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
     "vlm_qwen3vl_4b": ["--backbone", "vlm:Qwen/Qwen3-VL-4B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
+    # Same model as vlm_qwen3vl_4b under its own run folder, for round 2 with --extra-images (video
+    # frames): compares "4B + frames" against round 1's "4B" without retraining over the old run.
+    "vlm_qwen3vl_4b_frames": ["--backbone", "vlm:Qwen/Qwen3-VL-4B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
     # VLM + pose close-ups: each limb question sees the whole photo AND a full-resolution crop of
     # that limb, so small wounds survive the 448 px input. ~3x the vision cost of the plain VLM.
     "vlm_qwen3vl_2b_crops": ["--backbone", "vlm:Qwen/Qwen3-VL-2B-Instruct", "--limb-crops", "--lr", "1e-4",

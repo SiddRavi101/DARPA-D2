@@ -18,7 +18,7 @@ IMAGES=${IMAGES:-/workspace/img2048}                  # photos used in round 1
 LABELS=${LABELS:-/workspace/prequal/train/train_dataset.csv}
 VIDEO_ROOT=${VIDEO_ROOT:-/workspace/prequal/train}    # folder the CSV video paths are relative to
 WORK=${WORK:-/workspace/day_one}
-GROUPS="--groups-file $WORK/groups.csv"
+GRP="--groups-file $WORK/groups.csv"   # not "GROUPS": that is a reserved bash variable (= group ids)
 FRAMES=${FRAMES:-/workspace/frames}
 PER_VIDEO=${PER_VIDEO:-3}
 ROUND2=${ROUND2:-vlm_qwen3vl_4b_frames,vlm_qwen3vl_4b_crops}
@@ -26,6 +26,7 @@ WAIT_FOR=${WAIT_FOR:-}          # comma list of candidates another pod is traini
 ONLY_TRAIN=${ONLY_TRAIN:-0}     # 1 = train ROUND2 and stop (the other pod does leaderboard/final)
 export HF_HOME=${HF_HOME:-/root/hf} TORCH_HOME=${TORCH_HOME:-/root/torch}
 
+START=$(date +%s)
 stamp() { echo "=== $(date '+%F %T') $*"; }
 space() { df -h /workspace | tail -1; }
 guard() {  # stop before the volume fills (round 1 lost a run that way)
@@ -59,18 +60,19 @@ space; guard
 
 stamp "round-2 candidates: $ROUND2"
 python scripts/bakeoff.py run --images "$IMAGES" --labels "$LABELS" --runs "$WORK/runs" \
-  --candidates "$ROUND2" --epochs 15 $GROUPS "${EXTRA[@]}" -- --data-source darpa \
+  --candidates "$ROUND2" --epochs 15 $GRP "${EXTRA[@]}" -- --data-source darpa \
   || stamp "a round-2 candidate failed: leaderboard uses what finished"
 space; guard
 [ "$ONLY_TRAIN" = 1 ] && { stamp "ONLY_TRAIN: done"; exit 0; }
 
 for c in $(echo "$WAIT_FOR" | tr ',' ' '); do
   stamp "waiting for $c (other pod)"
-  while [ ! -s "$WORK/runs/$c/oof_probs.json" ] && [ ! -s "$WORK/runs/$c/run_info.json" ]; do sleep 120; done
+  # done = predictions exist, or the other pod recorded a result (run_info.json) after we started
+  while [ ! -s "$WORK/runs/$c/oof_probs.json" ] &&         [ "$(stat -c %Y "$WORK/runs/$c/run_info.json" 2>/dev/null || echo 0)" -lt "$START" ]; do sleep 120; done
 done
 
 stamp "leaderboard (greedy + stacker)"
-python scripts/bakeoff.py leaderboard --images "$IMAGES" --labels "$LABELS" --runs "$WORK/runs" $GROUPS \
+python scripts/bakeoff.py leaderboard --images "$IMAGES" --labels "$LABELS" --runs "$WORK/runs" $GRP \
   | tee "$WORK/leaderboard_round2.txt"
 
 # Frames go into the final retrain only if a frames-trained candidate is in the chosen ensemble.

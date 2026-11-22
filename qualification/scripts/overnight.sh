@@ -29,7 +29,7 @@ EXTRA=(); [ -n "$FRAMES" ] && EXTRA=(--extra-images "$FRAMES/images" --extra-lab
 
 stamp "round-2 candidates: $ROUND2"
 python scripts/bakeoff.py run --images "$IMAGES" --labels "$LABELS" --runs "$WORK/runs" \
-  --candidates "$ROUND2" $GROUPS "${EXTRA[@]}" || stamp "a round-2 candidate failed: leaderboard uses what finished"
+  --candidates "$ROUND2" --epochs 15 $GROUPS "${EXTRA[@]}" -- --data-source darpa || stamp "a round-2 candidate failed: leaderboard uses what finished"
 
 stamp "leaderboard (greedy + stacker)"
 python scripts/bakeoff.py leaderboard --images "$IMAGES" --labels "$LABELS" --runs "$WORK/runs" $GROUPS \
@@ -37,6 +37,6 @@ python scripts/bakeoff.py leaderboard --images "$IMAGES" --labels "$LABELS" --ru
 
 stamp "final retrain on all data, seeds 0,1,2"
 python scripts/bakeoff.py final --images "$IMAGES" --labels "$LABELS" --runs "$WORK/runs" \
-  --final "$WORK/runs_final" --out "$WORK/weights_final" "${EXTRA[@]}"
+  --final "$WORK/runs_final" --out "$WORK/weights_final" --epochs 15 "${EXTRA[@]}"
 
 stamp "done"; df -h /workspace

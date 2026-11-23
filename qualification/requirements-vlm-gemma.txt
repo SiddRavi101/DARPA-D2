@@ -2,7 +2,9 @@
 # "base" mentions gemma); the Dockerfile picks this file automatically. Gemma 4 needs transformers 5.x,
 # which needs huggingface_hub >= 1.31 (requirements.txt pins 0.35.3 for timm; this overrides it).
 # Do not mix Gemma and Qwen members in one image: the Qwen fast path is tested on 4.57.6 only.
-transformers==5.20.2
+# 5.18.0 is the newest release that still accepts torch 2.5.1 (the submission base image);
+# 5.20+ requires torch >= 2.6.
+transformers==5.18.0
 peft==0.21.0
 accelerate==1.15.0
 huggingface_hub==1.33.0

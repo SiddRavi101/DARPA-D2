@@ -537,9 +537,17 @@ class VLMEnsemble:
             if any(c for _, _, c in g.names):
                 kps = keypoints or [None] * len(images)
                 crops = [vlm_crops(im, kp, g.clf.image_size) for im, kp in zip(images, kps)]
+            # Generic (Gemma) path: GPU memory grows ~0.34 GB per photo (4 prompts x 2 TTA views).
+            # Measured on H100 2026-11-23, Gemma 4 E4B: batch 4 peaks at 11.65 GB, batch 16 at 15.70 GB
+            # (ICD limit < 16 GB), at the same speed. So Gemma runs in chunks of D2_VLM_BATCH (default 4).
+            step = max(1, len(images)) if g.clf.qwen else max(1, int(os.environ.get("D2_VLM_BATCH", "4")))
+            probs: dict = {}
             with g.clf.torch.inference_mode():
-                views = g.clf.encode_views(images, self.tta, crops)  # vision once, shared by every adapter
-                for adapter, dname, use_crops in g.names:
-                    g.clf.model.set_adapter(adapter)
-                    out.append((dname, g.clf.probs_from(views, use_crops)))
+                for s in range(0, len(images), step):
+                    sub_crops = crops[s:s + step] if crops is not None else None
+                    views = g.clf.encode_views(images[s:s + step], self.tta, sub_crops)  # shared by every adapter
+                    for adapter, dname, use_crops in g.names:
+                        g.clf.model.set_adapter(adapter)
+                        probs.setdefault(dname, []).append(g.clf.probs_from(views, use_crops))
+            out += [(dname, torch_cat(probs[dname], 0)) for _, dname, _ in g.names]
         return out

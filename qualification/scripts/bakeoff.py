@@ -65,6 +65,9 @@ CANDIDATES: dict[str, list[str]] = {
     # US-made alternative to Qwen (Google, Apache-2.0). Needs requirements-vlm-gemma.txt (transformers 5.x):
     # run it in its own environment, not in the same pip env as the Qwen candidates.
     "vlm_gemma4_e4b": ["--backbone", "vlm:google/gemma-4-E4B-it", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
+    # Gemma 4 E4B at 768 px (~256 soft tokens vs ~87 at 448) + wound/amputation photos seen twice per epoch
+    "vlm_gemma4_e4b_hr": ["--backbone", "vlm:google/gemma-4-E4B-it", "--vlm-size", "768", "--oversample-rare", "2",
+                          "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
     # Same model as vlm_qwen3vl_4b under its own run folder, for round 2 with --extra-images (video
     # frames): compares "4B + frames" against round 1's "4B" without retraining over the old run.
     "vlm_qwen3vl_4b_frames": ["--backbone", "vlm:Qwen/Qwen3-VL-4B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],

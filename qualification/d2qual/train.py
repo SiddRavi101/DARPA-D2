@@ -312,6 +312,8 @@ def main(argv=None) -> None:
                     help="pose-guided limb crops (runs the pose model once and caches keypoints)")
     ap.add_argument("--crop-size", type=int, default=224)
     ap.add_argument("--vlm-size", type=int, default=448, help="square input size for vlm:<model> backbones")
+    ap.add_argument("--oversample-rare", type=int, default=1,
+                    help="VLM: repeat photos with a wound/amputation label this many times per epoch")
     ap.add_argument("--extra-images", default=None,
                     help="extra TRAINING-only images, e.g. video frames from scripts/extract_video_frames.py")
     ap.add_argument("--extra-labels", default=None,

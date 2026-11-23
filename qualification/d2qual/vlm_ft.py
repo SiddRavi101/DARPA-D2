@@ -145,6 +145,12 @@ class VLMClassifier:
         self.processor = (AutoProcessor.from_pretrained(base, min_pixels=px, max_pixels=px) if self.qwen
                           else AutoProcessor.from_pretrained(base))
         self.processor.tokenizer.padding_side = "left"
+        ip = getattr(self.processor, "image_processor", None)
+        if not self.qwen and getattr(ip, "max_soft_tokens", None):
+            # Gemma 4: keep the soft-token budget large enough that a square image_size input is not
+            # shrunk again (tokens = (side / (patch * pool))^2); default 280 covers up to ~768 px.
+            unit = getattr(ip, "patch_size", 16) * getattr(ip, "pooling_kernel_size", 3)
+            ip.max_soft_tokens = max(ip.max_soft_tokens, math.ceil(image_size / unit) ** 2)
         dkw = {"dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype": self.dtype}
         model = None
         for cls_name in ("AutoModelForImageTextToText", "AutoModelForMultimodalLM",
@@ -372,9 +378,15 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback,
     print(f"vlm {base}: {n_train / 1e6:.1f}M trainable LoRA params", flush=True)
 
     rng = random.Random(args.seed)
+    # Class balancing: photos with a wound or amputation label are repeated `oversample_rare` times per epoch.
+    k_rare = max(1, int(getattr(args, "oversample_rare", 1) or 1))
+    rare = [i for i in train_ids if any(c in ("wound", "amputation") for c in labels[i] if c)]
+    pool = list(train_ids) + rare * (k_rare - 1)
+    if k_rare > 1:
+        print(f"oversampling {len(rare)} wound/amputation photos x{k_rare}: {len(pool)} per epoch", flush=True)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
-    steps = args.epochs * math.ceil(len(train_ids) / args.batch)
+    steps = args.epochs * math.ceil(len(pool) / args.batch)
     warm = max(1, int(0.05 * steps))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps))))
@@ -416,7 +428,7 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback,
     best = {"overall_accuracy": -1.0}
     model.train()
     for epoch in range(args.epochs):
-        order = list(train_ids)
+        order = list(pool)
         rng.shuffle(order)
         t0, running, n = time.time(), 0.0, 0
         for k in range(0, len(order), args.batch):

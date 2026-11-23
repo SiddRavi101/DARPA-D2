@@ -2,7 +2,9 @@
 Fine-tuned small vision-language model as an ensemble candidate (the PRONTO-style approach:
 their best limb-injury model was a compact VLM asked short per-limb questions).
 
-Models: Qwen2-VL-2B-Instruct or Qwen3-VL-2B/4B-Instruct (all Apache-2.0, ungated), LoRA-fine-tuned.
+Models: Qwen2-VL-2B-Instruct, Qwen3-VL-2B/4B-Instruct or Google Gemma 4 E4B-it (all Apache-2.0,
+ungated), LoRA-fine-tuned. Qwen uses a hand-written fast path; other bases use a plain forward.
+Gemma 4 needs requirements-vlm-gemma.txt (transformers 5.x), not requirements-vlm.txt.
 For every image we ask four questions, one per anatomical limb:
 
     "...Look at the casualty's LEFT ARM (the casualty's own left, not the viewer's left).
@@ -61,6 +63,42 @@ QUESTION = (
 CROP_INTRO = ("Second image: an automatic close-up of the casualty's {site}, cut out by a pose detector "
               "(it can be off-target, or plain grey when the limb was not found).")
 LORA_TARGETS = r".*\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"  # LLM only, not the vision tower
+# Non-Qwen bases (Gemma 4) name their vision/audio encoder blocks `layers` too: restrict to the text decoder.
+LORA_TARGETS_GENERIC = r".*language_model.*\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+
+
+def is_qwen(model_or_config) -> bool:
+    cfg = getattr(model_or_config, "config", model_or_config)
+    return str(getattr(cfg, "model_type", "")).startswith("qwen")
+
+
+def lora_targets(model) -> str:
+    return LORA_TARGETS if is_qwen(model) else LORA_TARGETS_GENERIC
+
+
+def _offload_lookup_tables(model, device) -> int:
+    """Move the model to `device` but keep Gemma's per-layer embedding (PLE) tables in CPU RAM.
+
+    Gemma 4 E4B is 8B params with embeddings (16 GB bf16) but 4.5B "effective": ~2.8B of it is
+    PLE lookup tables, read a few rows per token. ICD: the eval GPU has < 16 GB, so the tables stay
+    on CPU and only the looked-up rows travel to the GPU. Returns the number of params kept on CPU."""
+    import torch
+
+    found = [(n, m) for n, m in model.named_modules()
+             if isinstance(m, torch.nn.Embedding) and "per_layer" in n.split(".")[-1]]
+    parents = []
+    for name, mod in found:
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        attr = name.rsplit(".", 1)[-1]
+        setattr(parent, attr, torch.nn.Identity())  # detach so .to(device) never puts it on the GPU
+        parents.append((parent, attr, mod))
+    model.to(device)
+    for parent, attr, mod in parents:
+        mod.to("cpu")
+        mod.register_forward_pre_hook(lambda m, args: tuple(a.to("cpu") if torch.is_tensor(a) else a for a in args))
+        mod.register_forward_hook(lambda m, args, out: out.to(device))
+        setattr(parent, attr, mod)
+    return sum(m.weight.numel() for _, _, m in parents)
 
 
 def _question(site: int) -> str:
@@ -93,28 +131,47 @@ def mirror_view_crops(crops: list) -> list:
 class VLMClassifier:
     def __init__(self, base: str, device, image_size: int = 448, dtype=None, train: bool = False):
         import torch
-        from transformers import AutoProcessor
-
-        try:  # transformers >= 4.57: one class for Qwen2-VL, Qwen2.5-VL and Qwen3-VL
-            from transformers import AutoModelForImageTextToText as ModelCls
-        except ImportError:  # older pins
-            from transformers import Qwen2VLForConditionalGeneration as ModelCls
+        import transformers
+        from transformers import AutoConfig, AutoProcessor
 
         self.torch = torch
         self.device = device
         self.image_size = image_size
         self.dtype = dtype or (torch.bfloat16 if getattr(device, "type", "") == "cuda" else torch.float32)
+        self.qwen = is_qwen(AutoConfig.from_pretrained(base))
         px = image_size * image_size
-        self.processor = AutoProcessor.from_pretrained(base, min_pixels=px, max_pixels=px)
+        # Qwen: fixed pixel budget so every prompt has the same token count (fast path below).
+        # Others (Gemma 4): the processor's own resize; images are still letterboxed to a square.
+        self.processor = (AutoProcessor.from_pretrained(base, min_pixels=px, max_pixels=px) if self.qwen
+                          else AutoProcessor.from_pretrained(base))
         self.processor.tokenizer.padding_side = "left"
-        self.model = ModelCls.from_pretrained(
-            base, torch_dtype=self.dtype, attn_implementation="sdpa").to(device)
+        dkw = {"dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype": self.dtype}
+        model = None
+        for cls_name in ("AutoModelForImageTextToText", "AutoModelForMultimodalLM",
+                         "Qwen2VLForConditionalGeneration"):  # 4.57+: one class for Qwen2/2.5/3-VL; Gemma 4: MultimodalLM
+            cls = getattr(transformers, cls_name, None)
+            if cls is None:
+                continue
+            try:
+                model = cls.from_pretrained(base, attn_implementation="sdpa", **dkw)
+                break
+            except ValueError:  # this auto class has no mapping for the architecture
+                continue
+        assert model is not None, f"no transformers class loads {base}"
+        # Inference on the < 16 GB eval GPU: Gemma's PLE tables stay in CPU RAM (D2_VLM_OFFLOAD=0 to disable)
+        if not self.qwen and not train and getattr(device, "type", "") == "cuda" and os.environ.get("D2_VLM_OFFLOAD", "1") != "0":
+            n_cpu = _offload_lookup_tables(model, device)
+            log.info("vlm %s: %.2fB lookup-table params kept on CPU", base, n_cpu / 1e9)
+        else:
+            model.to(device)
+        self.model = model
         tok = self.processor.tokenizer
         ids = [tok.encode(L, add_special_tokens=False) for L in LETTERS]
         assert all(len(i) == 1 for i in ids), f"answer letters must be single tokens: {ids}"
         self.letter_ids = [i[0] for i in ids]
+        tkw = {} if self.qwen else {"enable_thinking": False}  # Gemma 4: answer directly, no thinking block
         self.prompts = {c: [self.processor.apply_chat_template(
-            [{"role": "user", "content": _content(s, c)}], tokenize=False, add_generation_prompt=True)
+            [{"role": "user", "content": _content(s, c)}], tokenize=False, add_generation_prompt=True, **tkw)
             for s in range(4)] for c in (False, True)}
         if not train:
             self.model.eval()
@@ -179,6 +236,11 @@ class VLMClassifier:
         from .data import letterbox
 
         sq = [letterbox(im, self.image_size) for im in images]
+        if not self.qwen:  # generic path: images go through the full model in logits_from
+            enc = {"n": len(sq), "images": sq}
+            if crops is not None:
+                enc["crops"] = [[letterbox(c, self.image_size) for c in four] for four in crops]
+            return enc
         emb, ds = self._vision(sq)
         enc = {"n": len(sq), "image_embeds": emb}
         if ds is not None:
@@ -203,6 +265,8 @@ class VLMClassifier:
     def logits_from(self, enc, crops: bool = False):
         """-> tensor (N, 4 sites, 4 classes) of answer-letter logits. crops=True uses the
         photo + limb close-up prompts (needs encode(..., crops=...))."""
+        if not self.qwen:
+            return self._logits_generic(enc, bool(crops and "crops" in enc))
         torch = self.torch
         core, _, lm, rope = self._parts()
         crops = bool(crops and "crop_embeds" in enc)
@@ -229,6 +293,25 @@ class VLMClassifier:
         w = core.lm_head.weight[self.letter_ids]
         logits = (hidden.to(w.dtype) @ w.T).float()
         return logits.view(n, 4, len(LETTERS))
+
+    def _logits_generic(self, enc, crops: bool):
+        """Any HF image-text-to-text model (Gemma 4): plain forward over the 4 limb prompts per photo,
+        answer-letter logits at the last position. Slower than the Qwen fast path (the vision encoder
+        runs once per prompt), but Gemma 4 E4B's encoder is small (~150M params)."""
+        n = enc["n"]
+        texts = [p for _ in range(n) for p in self.prompts[crops]]  # image-major: 4 questions per photo
+        ims = [[enc["images"][i]] + ([enc["crops"][i][s]] if crops else []) for i in range(n) for s in range(4)]
+        if "_inputs" not in enc:
+            enc["_inputs"] = {}
+        if crops not in enc["_inputs"]:  # processor work done once per view, reused by every adapter
+            enc["_inputs"][crops] = self.processor(text=texts, images=ims, padding=True, return_tensors="pt")
+        inp = {k: (v.to(self.device, self.dtype) if v.is_floating_point() else v.to(self.device))
+               for k, v in enc["_inputs"][crops].items() if hasattr(v, "to")}
+        try:
+            out = self.model(**inp, use_cache=False, logits_to_keep=1)
+        except TypeError:  # model without logits_to_keep
+            out = self.model(**inp, use_cache=False)
+        return out.logits[:, -1, self.letter_ids].float().view(n, 4, len(LETTERS))
 
     def letter_logits(self, images, crops=None):
         return self.logits_from(self.encode(images, crops), crops is not None)
@@ -280,7 +363,7 @@ def train_vlm(args, train_ids, val_ids, labels, out_dir: Path, device, fallback,
     model.config.use_cache = False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
-    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, target_modules=LORA_TARGETS))
+    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, target_modules=lora_targets(model)))
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()  # LoRA weights in fp32, base stays bf16

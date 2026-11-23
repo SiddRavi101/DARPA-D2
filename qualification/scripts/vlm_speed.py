@@ -51,25 +51,29 @@ def main():
     import torch
     from peft import LoraConfig, get_peft_model
 
-    from d2qual.vlm_ft import LORA_TARGETS, META, VLMClassifier, VLMEnsemble
+    from d2qual.vlm_ft import META, VLMClassifier, VLMEnsemble, lora_targets
 
     dev = torch.device("cuda")
     res = {"gpu": torch.cuda.get_device_name(0)}
 
-    # 1. equivalence on the base model
-    clf = VLMClassifier(a.base, dev)
+    # 1. equivalence on the base model (Qwen fast path only; other bases already use the plain forward)
+    clf = VLMClassifier(a.base, dev, train=True)  # train=True: no CPU offload while adapters are made
+    res["base_load_gb"] = round(torch.cuda.memory_allocated() / 1e9, 2)
     ims = fake_images(4, seed=1)
     with torch.inference_mode():
+        res["probs_base"] = clf.letter_logits(ims).softmax(-1)[0].tolist()
+    if clf.qwen:
+      with torch.inference_mode():
         fast = clf.letter_logits(ims).softmax(-1)
         ref = clf.letter_logits_reference(ims).softmax(-1)
-    res["max_abs_prob_diff_fast_vs_reference"] = float((fast - ref).abs().max())
-    res["argmax_agreement"] = float((fast.argmax(-1) == ref.argmax(-1)).float().mean())
+      res["max_abs_prob_diff_fast_vs_reference"] = float((fast - ref).abs().max())
+      res["argmax_agreement"] = float((fast.argmax(-1) == ref.argmax(-1)).float().mean())
     print("equivalence", res, flush=True)
 
     # 2. adapters
     tmp = Path(tempfile.mkdtemp())
     dirs = []
-    pm = get_peft_model(clf.model, LoraConfig(r=16, lora_alpha=32, target_modules=LORA_TARGETS, init_lora_weights="gaussian"))
+    pm = get_peft_model(clf.model, LoraConfig(r=16, lora_alpha=32, target_modules=lora_targets(clf.model), init_lora_weights="gaussian"))
     for k in range(3):
         d = tmp / f"vlm_fold{k}"
         pm.save_pretrained(d)
@@ -110,7 +114,7 @@ def main():
     m.config.use_cache = False
     m.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     m.enable_input_require_grads()
-    clf.model = get_peft_model(m, LoraConfig(r=16, lora_alpha=32, target_modules=LORA_TARGETS))
+    clf.model = get_peft_model(m, LoraConfig(r=16, lora_alpha=32, target_modules=lora_targets(clf.model)))
     y = torch.zeros(16, dtype=torch.long, device=dev)
     times = []
     for i in range(4):

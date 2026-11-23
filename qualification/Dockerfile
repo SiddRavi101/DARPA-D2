@@ -21,18 +21,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     D2_SUBMISSION_VERSION=${SUBMISSION_VERSION}
 
 WORKDIR /app
-COPY requirements.txt requirements-vlm.txt ./
+COPY requirements.txt requirements-vlm.txt requirements-vlm-gemma.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && rm -rf /root/.cache
 
 COPY d2qual/ d2qual/
 COPY inference.py validate_predictions.py entrypoint.sh ./
 # Trained checkpoints (fold*.pt / full.pt) — produced by `python -m d2qual.train`.
 # Limb-crop checkpoints also need model/pose/keypointrcnn.pth (submit.sh adds it).
-# VLM members (folders with vlm_meta.json) need model/vlm_base/ and requirements-vlm.txt;
+# VLM members (folders with vlm_meta.json) need model/vlm_base/ and requirements-vlm.txt
+# (requirements-vlm-gemma.txt for Gemma 4 bases);
 # the extra packages are installed only when such a member is present.
 COPY model/ model/
 RUN if ls model/weights/*/vlm_meta.json >/dev/null 2>&1; then \
-        pip install --no-cache-dir -r requirements-vlm.txt && rm -rf /root/.cache \
+        REQ=requirements-vlm.txt; grep -qil gemma model/weights/*/vlm_meta.json && REQ=requirements-vlm-gemma.txt; \
+        pip install --no-cache-dir -r $REQ && rm -rf /root/.cache \
         && python -c "import transformers, peft; print('vlm deps ok')"; fi \
     && chmod +x entrypoint.sh && mkdir -p /app/input /app/output \
     && python -c "import d2qual.predict, d2qual.pose, timm, torchvision, PIL, pillow_heif; from d2qual.data import HEIF_OK; assert HEIF_OK; print('import ok')"

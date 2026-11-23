@@ -62,6 +62,9 @@ CANDIDATES: dict[str, list[str]] = {
     # Qwen3-VL (Oct 2025, Apache-2.0): newer generation, needs transformers >= 4.57
     "vlm_qwen3vl_2b": ["--backbone", "vlm:Qwen/Qwen3-VL-2B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
     "vlm_qwen3vl_4b": ["--backbone", "vlm:Qwen/Qwen3-VL-4B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
+    # US-made alternative to Qwen (Google, Apache-2.0). Needs requirements-vlm-gemma.txt (transformers 5.x):
+    # run it in its own environment, not in the same pip env as the Qwen candidates.
+    "vlm_gemma4_e4b": ["--backbone", "vlm:google/gemma-4-E4B-it", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
     # Same model as vlm_qwen3vl_4b under its own run folder, for round 2 with --extra-images (video
     # frames): compares "4B + frames" against round 1's "4B" without retraining over the old run.
     "vlm_qwen3vl_4b_frames": ["--backbone", "vlm:Qwen/Qwen3-VL-4B-Instruct", "--lr", "1e-4", "--batch", "4", "--epochs", "3"],
